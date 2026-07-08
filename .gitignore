@@ -1,12 +1,14 @@
 # Local secrets and machine-specific config
 tools/factory_workstation/.env
 tools/factory_workstation/config.json
+tools/bare_board_workstation/config.json
 
 # Build outputs and test records
 dist/
 build/
 *.spec.bak
 factory_records/
+bare_board_records/
 
 # Python
 __pycache__/
