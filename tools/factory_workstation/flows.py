@@ -32,6 +32,16 @@ class FlowOutcome:
     results: list[CommandResult]
 
 
+@dataclass
+class StepContext:
+    next_index: int = 1
+
+    def take(self) -> int:
+        index = self.next_index
+        self.next_index += 1
+        return index
+
+
 def _filter_optional_steps(steps: list[FlowStep], skip_momo: bool) -> list[FlowStep]:
     if not skip_momo:
         return steps
@@ -56,9 +66,12 @@ def _run_steps(
     record: RecordSink,
     station_type: str,
     before_step: StepPromptCallback | None = None,
+    step_context: StepContext | None = None,
 ) -> FlowOutcome:
+    context = step_context or StepContext()
     results: list[CommandResult] = []
-    for index, step in enumerate(steps, start=1):
+    for step in steps:
+        index = context.take()
         if before_step is not None:
             before_step(step.label, station_type)
         record.start_step(index, step.label, step.command)
@@ -98,7 +111,7 @@ def _with_factory_lock_cleanup(
     record: RecordSink,
     station_type: str,
     progress: ProgressCallback,
-    base_index: int,
+    step_context: StepContext,
     outcome: FlowOutcome,
 ) -> FlowOutcome:
     if not _factory_unlocked(outcome.results):
@@ -106,8 +119,9 @@ def _with_factory_lock_cleanup(
 
     label = "Factory lock cleanup"
     command = "AT+FACTORY=LOCK"
-    record.start_step(base_index + 1, label, command)
-    progress(base_index + 1, label, "RUN", command)
+    index = step_context.take()
+    record.start_step(index, label, command)
+    progress(index, label, "RUN", command)
     t0 = time.monotonic()
     result = client.send_command(command, config.at_timeouts.default_s)
     elapsed_ms = int((time.monotonic() - t0) * 1000)
@@ -115,7 +129,7 @@ def _with_factory_lock_cleanup(
     if result.lines:
         detail += " | " + " ; ".join(result.lines[-3:])
     status = "PASS" if result.ok else "NG"
-    progress(base_index + 1, label, status, detail)
+    progress(index, label, status, detail)
     error_reason = "" if result.ok else (result.lines[-1] if result.lines else "timeout")
     record.log_item(
         station_type,
@@ -161,6 +175,7 @@ def _reconnect_nus(
 ) -> tuple[bool, CommandResult | None, str]:
     from .transport_ble import BLENusTransport
 
+    record.start_step(index, "OTA reconnect NUS", "AT")
     progress(index, "OTA reconnect NUS", "RUN", f"scanning {ble_name}")
     t0 = time.monotonic()
     try:
@@ -186,7 +201,16 @@ def _reconnect_nus(
     return True, probe_result, ""
 
 
-def _check_factory_capability(client: ATClient, record: RecordSink, station_type: str, progress: ProgressCallback, index: int) -> tuple[bool, int]:
+def _check_factory_capability(
+    client: ATClient,
+    record: RecordSink,
+    station_type: str,
+    progress: ProgressCallback,
+    step_context: StepContext,
+) -> tuple[bool, CommandResult]:
+    index = step_context.take()
+    record.start_step(index, "Factory AT capability", "AT+CAP?")
+    progress(index, "Factory AT capability", "RUN", "AT+CAP?")
     cap = client.send_command("AT+CAP?", 8.0)
     cap_line = " ; ".join(cap.lines)
     factory_ok = cap.ok and "factory_prod=1" in cap_line
@@ -195,7 +219,7 @@ def _check_factory_capability(client: ATClient, record: RecordSink, station_type
                     "" if factory_ok else "factory_prod not available", cap_line)
     progress(index, "Factory AT capability", "PASS" if factory_ok else "NG",
              " ; ".join(cap.lines[-2:]))
-    return factory_ok, index
+    return factory_ok, cap
 
 
 def _missing_required_token(config: WorkstationConfig, sn_enabled: bool, token: str) -> bool:
@@ -214,6 +238,38 @@ def _half_chip_communication_steps(config: WorkstationConfig) -> list[FlowStep]:
     ]
 
 
+def _full_capture_steps(config: WorkstationConfig) -> list[FlowStep]:
+    return [
+        FlowStep(
+            "Touch capture",
+            _capture_command(
+                config,
+                "AT+HW=TOUCH,CAPTURE,CONFIRM,3000",
+                "AT+HW=TOUCH,CAPTURE,CONFIRM,3000,COMPACT",
+            ),
+            config.at_timeouts.touch_capture_timeout_s(),
+        ),
+        FlowStep(
+            "LRA vibcapture",
+            _capture_command(
+                config,
+                "AT+HW=IMU,VIBCAPTURE,CONFIRM,50,3000,20",
+                "AT+HW=IMU,VIBCAPTURE,CONFIRM,50,3000,20,COMPACT",
+            ),
+            config.at_timeouts.vibcapture_timeout_s(),
+        ),
+        FlowStep(
+            "PPG reflect capture",
+            _capture_command(
+                config,
+                "AT+HW=PPG,CAPTURE,CONFIRM,REFLECT,3000,50",
+                "AT+HW=PPG,CAPTURE,CONFIRM,REFLECT,3000,50,COMPACT",
+            ),
+            config.at_timeouts.ppg_capture_timeout_s(),
+        ),
+    ]
+
+
 def run_half_machine(
     client: ATClient,
     config: WorkstationConfig,
@@ -224,6 +280,7 @@ def run_half_machine(
     sn_enabled: bool = True,
     before_step: StepPromptCallback | None = None,
     skip_momo: bool = False,
+    start_index: int = 1,
 ) -> FlowOutcome:
     if _missing_required_token(config, sn_enabled, token):
         record.finish("NG", "missing factory token")
@@ -236,7 +293,6 @@ def run_half_machine(
     steps = [
         FlowStep("AT probe", "AT"),
         FlowStep("Read version", "AT+VER?"),
-        FlowStep("Read capability", "AT+CAP?"),
     ]
     if token:
         steps.append(FlowStep("Factory unlock", f"AT+FACTORY=UNLOCK,{token}", config.at_timeouts.unlock_s))
@@ -266,14 +322,20 @@ def run_half_machine(
     if token:
         steps.append(FlowStep("Factory lock", "AT+FACTORY=LOCK", config.at_timeouts.default_s, required=False))
     steps = _filter_optional_steps(steps, skip_momo)
-    cap_ok, _ = _check_factory_capability(client, record, "half", progress, 0)
+    step_context = StepContext(start_index)
+    cap_ok, cap_result = _check_factory_capability(client, record, "half", progress, step_context)
     if not cap_ok:
         record.finish("NG", "factory AT not available on this firmware")
-        return FlowOutcome(False, "NG", "factory AT not available", [])
-    outcome = _run_steps(client, config, steps, progress, record, "half", before_step=before_step)
-    outcome = _with_factory_lock_cleanup(client, config, record, "half", progress, len(steps), outcome)
+        return FlowOutcome(False, "NG", "factory AT not available", [cap_result])
+    outcome = _run_steps(client, config, steps, progress, record, "half", before_step=before_step, step_context=step_context)
+    outcome = _with_factory_lock_cleanup(client, config, record, "half", progress, step_context, outcome)
     if sn_enabled:
-        _check_sn_source(client, record, "half", progress, len(steps))
+        sn_ok, sn_result = _check_sn_source(client, record, "half", progress, step_context)
+        if not sn_ok:
+            message = "SN persistence check failed"
+            if outcome.result != "PASS":
+                message = f"{outcome.message}; {message}"
+            outcome = FlowOutcome(False, "NG", message, outcome.results + [sn_result])
     record.finish(outcome.result, outcome.message)
     return outcome
 
@@ -288,6 +350,7 @@ def run_full_machine(
     sn_enabled: bool = True,
     before_step: StepPromptCallback | None = None,
     skip_momo: bool = False,
+    start_index: int = 1,
 ) -> FlowOutcome:
     if _missing_required_token(config, sn_enabled, token):
         record.finish("NG", "missing factory token")
@@ -304,94 +367,39 @@ def run_full_machine(
     ]
     if sn_enabled:
         steps.insert(2, FlowStep("Read SN", "AT+SN?"))
-    cap_ok, _ = _check_factory_capability(client, record, "full", progress, 0)
+    step_context = StepContext(start_index)
+    cap_ok, cap_result = _check_factory_capability(client, record, "full", progress, step_context)
     if not cap_ok:
         record.finish("NG", "factory AT not available on this firmware")
-        return FlowOutcome(False, "NG", "factory AT not available", [])
+        return FlowOutcome(False, "NG", "factory AT not available", [cap_result])
     if config.ota_enabled:
-        outcome = _run_steps(client, config, steps, progress, record, "full", before_step=before_step)
+        outcome = _run_steps(client, config, steps, progress, record, "full", before_step=before_step, step_context=step_context)
         if not outcome.ok:
             record.finish(outcome.result, outcome.message)
             return outcome
-        ota_outcome = _run_ota_phase(client, config, record, progress, len(steps))
+        ota_outcome = _run_ota_phase(client, config, record, progress, step_context)
         if not ota_outcome.ok:
             record.finish(ota_outcome.result, f"OTA phase failed: {ota_outcome.message}")
             return ota_outcome
         post_steps = []
         if token:
             post_steps.append(FlowStep("Factory unlock", f"AT+FACTORY=UNLOCK,{token}", config.at_timeouts.unlock_s))
-        post_steps.extend([
-            FlowStep(
-                "Touch capture",
-                _capture_command(
-                    config,
-                    "AT+HW=TOUCH,CAPTURE,CONFIRM,3000",
-                    "AT+HW=TOUCH,CAPTURE,CONFIRM,3000,COMPACT",
-                ),
-                config.at_timeouts.touch_capture_timeout_s(),
-            ),
-            FlowStep(
-                "LRA vibcapture",
-                _capture_command(
-                    config,
-                    "AT+HW=IMU,VIBCAPTURE,CONFIRM,50,3000,20",
-                    "AT+HW=IMU,VIBCAPTURE,CONFIRM,50,3000,20,COMPACT",
-                ),
-                config.at_timeouts.vibcapture_timeout_s(),
-            ),
-            FlowStep(
-                "PPG reflect capture",
-                _capture_command(
-                    config,
-                    "AT+HW=PPG,CAPTURE,CONFIRM,REFLECT,3000,50",
-                    "AT+HW=PPG,CAPTURE,CONFIRM,REFLECT,3000,50,COMPACT",
-                ),
-                config.at_timeouts.ppg_capture_timeout_s(),
-            ),
-        ])
+        post_steps.extend(_full_capture_steps(config))
         if token:
             post_steps.append(FlowStep("Factory lock", "AT+FACTORY=LOCK", config.at_timeouts.default_s, required=False))
         post_steps = _filter_optional_steps(post_steps, skip_momo)
-        final = _run_steps(client, config, post_steps, progress, record, "full", before_step=before_step)
-        final = _with_factory_lock_cleanup(client, config, record, "full", progress, len(post_steps), final)
+        final = _run_steps(client, config, post_steps, progress, record, "full", before_step=before_step, step_context=step_context)
+        final = _with_factory_lock_cleanup(client, config, record, "full", progress, step_context, final)
         record.finish(final.result, final.message)
         return final
     if token:
         steps.append(FlowStep("Factory unlock", f"AT+FACTORY=UNLOCK,{token}", config.at_timeouts.unlock_s))
-    steps += [
-        FlowStep(
-            "Touch capture",
-            _capture_command(
-                config,
-                "AT+HW=TOUCH,CAPTURE,CONFIRM,3000",
-                "AT+HW=TOUCH,CAPTURE,CONFIRM,3000,COMPACT",
-            ),
-            config.at_timeouts.touch_capture_timeout_s(),
-        ),
-        FlowStep(
-            "LRA vibcapture",
-            _capture_command(
-                config,
-                "AT+HW=IMU,VIBCAPTURE,CONFIRM,50,3000,20",
-                "AT+HW=IMU,VIBCAPTURE,CONFIRM,50,3000,20,COMPACT",
-            ),
-            config.at_timeouts.vibcapture_timeout_s(),
-        ),
-        FlowStep(
-            "PPG reflect capture",
-            _capture_command(
-                config,
-                "AT+HW=PPG,CAPTURE,CONFIRM,REFLECT,3000,50",
-                "AT+HW=PPG,CAPTURE,CONFIRM,REFLECT,3000,50,COMPACT",
-            ),
-            config.at_timeouts.ppg_capture_timeout_s(),
-        ),
-    ]
+    steps += _full_capture_steps(config)
     if token:
         steps.append(FlowStep("Factory lock", "AT+FACTORY=LOCK", config.at_timeouts.default_s, required=False))
     steps = _filter_optional_steps(steps, skip_momo)
-    outcome = _run_steps(client, config, steps, progress, record, "full", before_step=before_step)
-    outcome = _with_factory_lock_cleanup(client, config, record, "full", progress, len(steps), outcome)
+    outcome = _run_steps(client, config, steps, progress, record, "full", before_step=before_step, step_context=step_context)
+    outcome = _with_factory_lock_cleanup(client, config, record, "full", progress, step_context, outcome)
     record.finish(outcome.result, outcome.message)
     return outcome
 
@@ -401,7 +409,7 @@ def _run_ota_phase(
     config: WorkstationConfig,
     record: RecordSink,
     progress: ProgressCallback,
-    base_index: int,
+    step_context: StepContext,
 ) -> FlowOutcome:
     from .ota_runner import build_ota_command, run_ota
     from .transport_ble import BLENusTransport
@@ -417,16 +425,20 @@ def _run_ota_phase(
     ble_scan_timeout = transport.scan_timeout_s
     ble_backend_kwargs = getattr(transport, "dongle_kwargs", {})
 
-    idx = base_index + 1
     results: list[CommandResult] = []
 
+    idx = step_context.take()
+    record.start_step(idx, "OTA version before", "AT+VER?")
+    progress(idx, "OTA version before", "RUN", "AT+VER?")
     ver_before = client.send_command("AT+VER?", 8.0)
     results.append(ver_before)
     record.log_item("full", "OTA version before", "AT+VER?", "PASS" if ver_before.ok else "NG",
                     int(ver_before.elapsed_s * 1000), "", " ; ".join(ver_before.lines[-3:]))
     progress(idx, "OTA version before", "PASS" if ver_before.ok else "NG", " ; ".join(ver_before.lines[-2:]))
-    idx += 1
 
+    idx = step_context.take()
+    record.start_step(idx, "OTA busy check", "AT+OTABUSY?")
+    progress(idx, "OTA busy check", "RUN", "AT+OTABUSY?")
     ota_busy = client.send_command("AT+OTABUSY?", 5.0)
     results.append(ota_busy)
     busy_text = _joined_lines(ota_busy)
@@ -435,28 +447,31 @@ def _run_ota_phase(
                     int(ota_busy.elapsed_s * 1000),
                     "ota busy locked" if busy_locked else "", " ; ".join(ota_busy.lines[-3:]))
     progress(idx, "OTA busy check", "PASS" if ota_busy.ok and not busy_locked else "NG", " ; ".join(ota_busy.lines[-2:]))
-    idx += 1
     if busy_locked:
         return FlowOutcome(False, "NG", "OTA busy locked (factory active)", results)
 
     image_path = Path(config.ota_image_path)
+    idx = step_context.take()
+    record.start_step(idx, "OTA image check", str(image_path))
     if not image_path.exists():
         record.log_item("full", "OTA image check", str(image_path), "NG", 0, "image not found", "")
         progress(idx, "OTA image check", "NG", f"not found: {image_path}")
         return FlowOutcome(False, "NG", f"OTA image not found: {image_path}", results)
     record.log_item("full", "OTA image check", str(image_path), "PASS", 0, "", f"size={image_path.stat().st_size}")
     progress(idx, "OTA image check", "PASS", f"size={image_path.stat().st_size}")
-    idx += 1
 
+    idx = step_context.take()
+    record.start_step(idx, "OTA disconnect NUS", "close")
     progress(idx, "OTA disconnect NUS", "RUN", "closing BLE NUS")
     client.close()
     record.log_item("full", "OTA disconnect NUS", "close", "PASS", 0, "", "nus closed for smp upload")
-    idx += 1
 
     time.sleep(5.0)
 
     ota_command = build_ota_command(config, ble_address)
     ota_script_name = ota_command.script_name
+    idx = step_context.take()
+    record.start_step(idx, "OTA upload", f"{ota_script_name} {image_path.name}")
     progress(idx, "OTA upload", "RUN", f"{image_path.name}")
     record.log_item("full", "OTA upload", f"{ota_script_name} {image_path.name}", "RUN", 0, "", "uploading")
     ota_lines: list[str] = []
@@ -473,7 +488,8 @@ def _run_ota_phase(
         elapsed_ms = int((time.monotonic() - t0) * 1000)
         record.log_item("full", "OTA upload", ota_script_name, "NG", elapsed_ms, str(exc), "")
         progress(idx, "OTA upload", "NG", str(exc))
-        _reconnect_nus(client, ble_name, ble_address, ble_scan_timeout, record, progress, idx + 1, probe=False, ble_backend_kwargs=ble_backend_kwargs)
+        reconnect_index = step_context.take()
+        _reconnect_nus(client, ble_name, ble_address, ble_scan_timeout, record, progress, reconnect_index, probe=False, ble_backend_kwargs=ble_backend_kwargs)
         return FlowOutcome(False, "NG", f"OTA upload exception: {exc}", results)
     elapsed_ms = int((time.monotonic() - t0) * 1000)
     ota_output = " ".join(ota_lines)
@@ -490,21 +506,24 @@ def _run_ota_phase(
     record.log_item("full", "OTA upload", ota_script_name, "PASS" if ota_ok else "NG", elapsed_ms,
                     ota_reason, f"exit_code={exit_code}")
     progress(idx, "OTA upload", "PASS" if ota_ok else "NG", f"exit_code={exit_code} elapsed={elapsed_ms}ms {ota_reason}")
-    idx += 1
     if not ota_ok:
+        idx = step_context.take()
         _reconnect_nus(client, ble_name, ble_address, ble_scan_timeout, record, progress, idx, probe=False, ble_backend_kwargs=ble_backend_kwargs)
         return FlowOutcome(False, "NG", f"OTA upload failed exit_code={exit_code}", results)
 
     if same_hash:
+        idx = step_context.take()
         reconnect_ok, probe_result, reconnect_reason = _reconnect_nus(
             client, ble_name, ble_address, ble_scan_timeout, record, progress, idx, probe=True, ble_backend_kwargs=ble_backend_kwargs
         )
         if probe_result is not None:
             results.append(probe_result)
-        idx += 1
         if not reconnect_ok:
             return FlowOutcome(False, "NG", f"OTA reconnect failed: {reconnect_reason}", results)
 
+        idx = step_context.take()
+        record.start_step(idx, "OTA state check", "AT+OTA?")
+        progress(idx, "OTA state check", "RUN", "AT+OTA?")
         ota_state = client.send_command("AT+OTA?", 5.0)
         results.append(ota_state)
         ota_state_text = _joined_lines(ota_state)
@@ -514,8 +533,10 @@ def _run_ota_phase(
                         " ; ".join(ota_state.lines[-3:]))
         progress(idx, "OTA state check", "WARN" if ota_locked else ("PASS" if ota_state.ok else "NG"),
                  " ; ".join(ota_state.lines[-2:]))
-        idx += 1
 
+        idx = step_context.take()
+        record.start_step(idx, "OTA busy after same-hash", "AT+OTABUSY?")
+        progress(idx, "OTA busy after same-hash", "RUN", "AT+OTABUSY?")
         ota_busy_after = client.send_command("AT+OTABUSY?", 5.0)
         results.append(ota_busy_after)
         ota_busy_text = _joined_lines(ota_busy_after)
@@ -531,20 +552,24 @@ def _run_ota_phase(
             results,
         )
 
+    idx = step_context.take()
+    record.start_step(idx, "OTA reboot wait", "sleep")
     progress(idx, "OTA reboot wait", "RUN", f"waiting {config.ota_reboot_wait_s}s")
     time.sleep(config.ota_reboot_wait_s)
     record.log_item("full", "OTA reboot wait", "sleep", "PASS", int(config.ota_reboot_wait_s * 1000), "", "")
-    idx += 1
 
+    idx = step_context.take()
     reconnect_ok, probe, reconnect_reason = _reconnect_nus(
         client, ble_name, ble_address, ble_scan_timeout, record, progress, idx, probe=True, ble_backend_kwargs=ble_backend_kwargs
     )
     if probe is not None:
         results.append(probe)
-    idx += 1
     if not reconnect_ok:
         return FlowOutcome(False, "NG", f"OTA reconnect failed: {reconnect_reason}", results)
 
+    idx = step_context.take()
+    record.start_step(idx, "OTA busy after reboot", "AT+OTABUSY?")
+    progress(idx, "OTA busy after reboot", "RUN", "AT+OTABUSY?")
     ota_busy_after = client.send_command("AT+OTABUSY?", 8.0)
     results.append(ota_busy_after)
     ota_busy_after_text = _joined_lines(ota_busy_after)
@@ -553,10 +578,12 @@ def _run_ota_phase(
                     int(ota_busy_after.elapsed_s * 1000),
                     "" if ota_clear else "OTA lock not clear", " ; ".join(ota_busy_after.lines[-3:]))
     progress(idx, "OTA busy after reboot", "PASS" if ota_clear else "NG", " ; ".join(ota_busy_after.lines[-2:]))
-    idx += 1
     if not ota_clear:
         return FlowOutcome(False, "NG", "OTA lock did not clear after reconnect", results)
 
+    idx = step_context.take()
+    record.start_step(idx, "OTA version after", "AT+VER?")
+    progress(idx, "OTA version after", "RUN", "AT+VER?")
     ver_after = client.send_command("AT+VER?", 8.0)
     results.append(ver_after)
     record.log_item("full", "OTA version after", "AT+VER?", "PASS" if ver_after.ok else "NG",
@@ -571,8 +598,11 @@ def _check_sn_source(
     record: RecordSink,
     station_type: str,
     progress: ProgressCallback,
-    base_index: int,
-) -> None:
+    step_context: StepContext,
+) -> tuple[bool, CommandResult]:
+    index = step_context.take()
+    record.start_step(index, "SN persistence check", "AT+SN?")
+    progress(index, "SN persistence check", "RUN", "AT+SN?")
     result = client.send_command("AT+SN?", 5.0)
     source = ""
     for line in result.lines:
@@ -583,6 +613,7 @@ def _check_sn_source(
                     source = part.split("=", 1)[1]
                     break
     sn_ok = result.ok and source == "lfs"
+    detail = " ; ".join(result.lines[-3:])
     record.log_item(
         station_type,
         "SN persistence check",
@@ -590,5 +621,7 @@ def _check_sn_source(
         "PASS" if sn_ok else "NG",
         int(result.elapsed_s * 1000),
         "" if sn_ok else f"source={source or 'unknown'} (expected lfs)",
-        " ; ".join(result.lines[-3:]),
+        detail,
     )
+    progress(index, "SN persistence check", "PASS" if sn_ok else "NG", detail)
+    return sn_ok, result

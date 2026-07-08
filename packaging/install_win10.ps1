@@ -60,7 +60,8 @@ function Expand-PayloadZip {
     do {
         Start-Sleep -Milliseconds 500
         $sourceRoot = Join-Path $Destination "Axi Factory Workstation"
-        if (Test-Path -LiteralPath $sourceRoot) {
+        $rootExe = Join-Path $Destination "Axi Factory Workstation.exe"
+        if ((Test-Path -LiteralPath $sourceRoot) -or (Test-Path -LiteralPath $rootExe)) {
             return
         }
     } while ((Get-Date) -lt $deadline)
@@ -170,6 +171,23 @@ function Select-InstallRoot {
     }
 }
 
+function Resolve-PayloadSourceRoot {
+    param([string]$ExtractionRoot)
+
+    $nestedRoot = Join-Path $ExtractionRoot "Axi Factory Workstation"
+    $nestedExe = Join-Path $nestedRoot "Axi Factory Workstation.exe"
+    if (Test-Path -LiteralPath $nestedExe) {
+        return $nestedRoot
+    }
+
+    $rootExe = Join-Path $ExtractionRoot "Axi Factory Workstation.exe"
+    if (Test-Path -LiteralPath $rootExe) {
+        return $ExtractionRoot
+    }
+
+    throw "Payload executable not found after extraction. Checked: $nestedExe ; $rootExe"
+}
+
 try {
     if (Test-Path -LiteralPath $script:LogPath) {
         Remove-Item -LiteralPath $script:LogPath -Force
@@ -187,18 +205,16 @@ try {
     $installRoot = [System.IO.Path]::GetFullPath($installRoot)
     Write-InstallLog "Install root: $installRoot"
 
-    $installParent = Split-Path -Parent $installRoot
-    New-Item -ItemType Directory -Force -Path $installParent | Out-Null
+    # Only create the install folder itself. Creating the drive root for paths
+    # such as E:\AXI can fail on some locked-down factory PCs.
     New-Item -ItemType Directory -Force -Path $installRoot | Out-Null
 
     $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("AxiFactoryWorkstation_" + [System.Guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
     try {
         Expand-PayloadZip -ZipPath $payloadZip -Destination $tempRoot
-        $sourceRoot = Join-Path $tempRoot "Axi Factory Workstation"
-        if (-not (Test-Path -LiteralPath $sourceRoot)) {
-            throw "Payload folder not found: $sourceRoot"
-        }
+        $sourceRoot = Resolve-PayloadSourceRoot -ExtractionRoot $tempRoot
+        Write-InstallLog "Payload source root: $sourceRoot"
 
         Get-ChildItem -LiteralPath $sourceRoot -Force | ForEach-Object {
             if (@("config.json", ".env", ".env.template", "factory_records") -contains $_.Name) {
@@ -208,8 +224,23 @@ try {
         }
 
         $configPath = Join-Path $installRoot "config.json"
-        if (-not (Test-Path -LiteralPath $configPath)) {
-            Copy-Item -LiteralPath (Join-Path $sourceRoot "config.json") -Destination $configPath -Force
+        $sourceConfig = Join-Path $sourceRoot "config.json"
+        $forceConfig = $env:AXI_FACTORY_FORCE_CONFIG -eq "1"
+        $configValid = $false
+        if ((Test-Path -LiteralPath $configPath) -and -not $forceConfig) {
+            try {
+                $cfgBytes = [System.IO.File]::ReadAllBytes($configPath)
+                if ($cfgBytes.Length -gt 0 -and -not ($cfgBytes[0] -eq 0x7B -and $cfgBytes.Length -ge 2 -and $cfgBytes[1] -eq 0x00)) {
+                    $null = ([System.Text.Encoding]::UTF8.GetString($cfgBytes) | ConvertFrom-Json)
+                    $configValid = $true
+                }
+            } catch {
+                Write-InstallLog "Existing config.json is invalid; replacing from payload"
+            }
+        }
+        if (-not $configValid) {
+            Copy-Item -LiteralPath $sourceConfig -Destination $configPath -Force
+            Write-InstallLog "Wrote config.json from payload"
         }
 
         $envTemplatePath = Join-Path $installRoot ".env.template"

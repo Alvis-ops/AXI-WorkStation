@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import queue
+import subprocess
 import threading
+import time
 import tkinter as tk
+from dataclasses import replace
 from tkinter import filedialog, messagebox, simpledialog
 from pathlib import Path
 
@@ -19,6 +22,8 @@ from .config import (
     save_config,
     verify_engineer_password,
 )
+from .flash_flow import flash_payload, precheck_flash_request, probe_at_client, record_flash_step
+from .flash_runner import FlashOutcome, file_sha256, run_flash
 from .flows import FlowOutcome, run_full_machine, run_half_machine
 from .ota_runner import build_ota_command, run_ota
 from .storage import NullRunRecord, RunStorage
@@ -31,6 +36,8 @@ STEP_LABELS_ZH = {
     "Read version": "读取固件版本",
     "Read capability": "读取能力信息",
     "Factory AT capability": "检查工厂 AT 能力",
+    "Firmware flash": "固件烧录",
+    "Flash reconnect": "烧录后重连",
     "Factory unlock": "解锁工厂模式",
     "Factory lock": "锁回工厂模式",
     "Factory lock cleanup": "失败后锁回工厂模式",
@@ -89,17 +96,33 @@ STEP_STATUS_COLORS = {
 
 MOMO_TOUCH_STEPS = {"Touch ISR"}
 
+RECORD_OUTPUT_MODE_LABELS = {
+    "unified": "集成记录（单个 unified_log.csv）",
+    "split": "分散记录（兼容多文件）",
+}
+
+
+def _record_output_label(mode: str) -> str:
+    return RECORD_OUTPUT_MODE_LABELS.get(str(mode).strip().lower(), RECORD_OUTPUT_MODE_LABELS["unified"])
+
+
+def _record_output_mode(label: str) -> str:
+    for mode, text in RECORD_OUTPUT_MODE_LABELS.items():
+        if label == text:
+            return mode
+    return "unified"
+
 
 class WorkstationApp(ttk.Window):
     def __init__(self) -> None:
         super().__init__(themename="flatly")
         self.title("Axi Factory Workstation")
-        screen_width = self.winfo_screenwidth()
-        screen_height = self.winfo_screenheight()
-        width = int(screen_width * 0.675)
-        height = int(screen_height * 0.675)
+        width, height, min_width, min_height = self._window_bounds()
+        self.compact_layout = width < 1280 or height < 760
+        self._last_layout_compact = self.compact_layout
+        self._initial_window_width = width
         self.geometry(f"{width}x{height}")
-        self.minsize(1400, 900)
+        self.minsize(min_width, min_height)
         self.config_model = load_config()
         self.client: ATClient | None = None
         self.transport_label = tk.StringVar(value="未连接")
@@ -109,6 +132,9 @@ class WorkstationApp(ttk.Window):
         self.ble_devices: list[BLEDeviceInfo] = []
         self.step_status_labels: dict[str, tk.Label] = {}
         self.step_status_state: dict[str, tuple[str, str]] = {}
+        self._step_tree_compact_columns: bool | None = None
+        self._step_status_refresh_job: str | None = None
+        self._help_panel_built = False
         self.active_flow_kind = ""
         self.active_flow_sn = ""
         self.last_half_sn = ""
@@ -120,7 +146,22 @@ class WorkstationApp(ttk.Window):
         self._refresh_ports()
         self._apply_access_state()
         self._center_window()
+        self._restore_main_sash()
+        self.bind("<Configure>", self._on_window_configure)
         self.after(80, self._poll_events)
+
+    def _window_bounds(self) -> tuple[int, int, int, int]:
+        screen_width = max(800, self.winfo_screenwidth())
+        screen_height = max(600, self.winfo_screenheight())
+        reserve_width = 80 if screen_width >= 1100 else 40
+        reserve_height = 80 if screen_height >= 760 else 60
+        usable_width = max(720, screen_width - reserve_width)
+        usable_height = max(520, screen_height - reserve_height)
+        min_width = min(820, usable_width)
+        min_height = min(560, usable_height)
+        width = max(min_width, min(2360, usable_width, int(screen_width * 0.615)))
+        height = max(min_height, min(1480, usable_height, int(screen_height * 0.685)))
+        return width, height, min_width, min_height
 
     def _center_window(self) -> None:
         self.update_idletasks()
@@ -131,6 +172,114 @@ class WorkstationApp(ttk.Window):
         x = max(0, (screen_width - width) // 2)
         y = max(0, (screen_height - height) // 2 - 30)
         self.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _on_window_configure(self, event) -> None:
+        if event.widget is not self:
+            return
+        self.compact_layout = event.width < 1280 or event.height < 760
+        if self.compact_layout == self._last_layout_compact:
+            return
+        self._last_layout_compact = self.compact_layout
+        self._apply_responsive_layout()
+
+    def _target_left_width(self, total_width: int | None = None) -> int:
+        if total_width is None:
+            total_width = max(self.winfo_width(), getattr(self, "_initial_window_width", 0), 1360)
+        target = int(total_width * 0.48)
+        if self.compact_layout:
+            return max(380, min(620, target))
+        return max(640, min(1120, target))
+
+    def _apply_responsive_layout(self) -> None:
+        left_width = self._target_left_width()
+        if hasattr(self, "left_panel"):
+            self.left_panel.configure(width=left_width)
+        if hasattr(self, "main_panes"):
+            self.after_idle(lambda width=left_width: self._set_main_sash(width))
+        if hasattr(self, "connection_status_label"):
+            self.connection_status_label.configure(
+                width=10 if self.compact_layout else 12,
+                padx=8,
+            )
+        if hasattr(self, "step_tree"):
+            self.step_tree.configure(height=7 if self.compact_layout else 10)
+            self._configure_step_tree_columns()
+            self._schedule_step_status_refresh()
+        if hasattr(self, "log_text"):
+            self.log_text.configure(
+                height=7 if self.compact_layout else 12,
+                width=42 if self.compact_layout else 50,
+            )
+
+    def _configure_step_tree_columns(self) -> None:
+        tree_width = self.step_tree.winfo_width()
+        compact_columns = self.compact_layout or (tree_width > 1 and tree_width < 620)
+        if compact_columns == self._step_tree_compact_columns:
+            return
+        self._step_tree_compact_columns = compact_columns
+
+        if compact_columns:
+            self.step_tree.configure(displaycolumns=("idx", "step", "status"))
+            widths = {
+                "idx": (44, 36, False),
+                "step": (210, 150, True),
+                "status": (92, 78, False),
+                "detail": (0, 0, False),
+            }
+        else:
+            self.step_tree.configure(displaycolumns=("idx", "step", "status", "detail"))
+            widths = {
+                "idx": (44, 36, False),
+                "step": (300, 180, True),
+                "status": (100, 82, False),
+                "detail": (420, 160, True),
+            }
+        for column, (width, minwidth, stretch) in widths.items():
+            self.step_tree.column(column, width=width, minwidth=minwidth, stretch=stretch)
+
+    def _on_step_tree_configure(self) -> None:
+        self._configure_step_tree_columns()
+        self._schedule_step_status_refresh(60)
+
+    def _set_main_sash(self, left_width: int) -> None:
+        try:
+            self.main_panes.sashpos(0, left_width)
+        except tk.TclError:
+            pass
+
+    def _restore_main_sash(self) -> None:
+        left_width = self._target_left_width()
+        self._set_main_sash(left_width)
+        self.after(80, lambda width=left_width: self._set_main_sash(width))
+
+    def _add_scrollable_tab(self, tabs: ttk.Notebook, text: str) -> tuple[ttk.Frame, ttk.Frame]:
+        outer = ttk.Frame(tabs)
+        tabs.add(outer, text=text)
+
+        canvas = tk.Canvas(outer, highlightthickness=0, borderwidth=0)
+        scrollbar = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=canvas.yview)
+        content = ttk.Frame(canvas, padding=10)
+        window_id = canvas.create_window((0, 0), window=content, anchor=tk.NW)
+
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def update_scroll_region(_event=None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def fit_content_width(event) -> None:
+            canvas.itemconfigure(window_id, width=event.width)
+
+        def on_mousewheel(event) -> str:
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            return "break"
+
+        content.bind("<Configure>", update_scroll_region)
+        canvas.bind("<Configure>", fit_content_width)
+        outer.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", on_mousewheel))
+        outer.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+        return outer, content
 
     def _build_vars(self) -> None:
         cfg = self.config_model
@@ -152,9 +301,18 @@ class WorkstationApp(ttk.Window):
         self.station_var = tk.StringVar(value=cfg.station_id)
         self.dut_alias_var = tk.StringVar(value=cfg.dut_alias)
         self.records_root_var = tk.StringVar(value=cfg.records_root)
+        self.record_output_mode_var = tk.StringVar(value=_record_output_label(cfg.record_output_mode))
         self.ota_image_var = tk.StringVar(value=cfg.ota_image_path)
         self.firmware_repo_var = tk.StringVar(value=cfg.firmware_repo)
         self.flash_script_var = tk.StringVar(value=cfg.flash_script_path)
+        self.half_flash_before_test_var = tk.BooleanVar(value=cfg.half_flash_before_test)
+        self.flash_backend_var = tk.StringVar(value=cfg.flash_backend or "nrfjprog")
+        self.flash_image_var = tk.StringVar(value=cfg.flash_image_path)
+        self.half_flash_image_var = tk.StringVar(value=cfg.half_flash_image_path)
+        self.flash_after_wait_var = tk.StringVar(value=str(cfg.flash_after_wait_s))
+        self.flash_verify_var = tk.BooleanVar(value=cfg.flash_verify)
+        self.nrfjprog_path_var = tk.StringVar(value=cfg.nrfjprog_path)
+        self.half_flash_status_var = tk.StringVar()
         self.jlink_var = tk.StringVar(value=cfg.jlink_probe_id)
         self.sn_min_var = tk.StringVar(value=str(cfg.sn_rule.min_len))
         self.sn_max_var = tk.StringVar(value=str(cfg.sn_rule.max_len))
@@ -166,6 +324,7 @@ class WorkstationApp(ttk.Window):
         style.configure("Title.TLabel", font=("Microsoft YaHei UI", 11, "bold"))
         style.configure("Status.TLabel", font=("Microsoft YaHei UI", 10, "bold"))
         style.configure("LogTool.TButton", font=("Microsoft YaHei UI", 10), padding=(10, 5))
+        style.configure("Toolbar.TButton", font=("Microsoft YaHei UI", 10), padding=(8, 4))
         style.configure(
             "Step.Treeview",
             font=("Microsoft YaHei UI", 11),
@@ -187,15 +346,20 @@ class WorkstationApp(ttk.Window):
 
         panes = ttk.Panedwindow(root, orient=tk.HORIZONTAL)
         panes.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        self.main_panes = panes
 
-        left = ttk.Frame(panes, padding=(0, 0, 8, 0), width=380)
+        left_width = self._target_left_width()
+        left = ttk.Frame(panes, padding=(0, 0, 8, 0), width=left_width)
         right = ttk.Frame(panes)
+        self.left_panel = left
+        left.pack_propagate(False)
         panes.add(left, weight=0)
         panes.add(right, weight=1)
 
         self.tabs = ttk.Notebook(left)
         self.tabs.pack(fill=tk.BOTH, expand=True)
         self._build_run_tab(self.tabs)
+        self._build_flash_tab(self.tabs)
         self._build_ble_tab(self.tabs)
         self._build_settings_tab(self.tabs)
         self._build_more_tab(self.tabs)
@@ -205,47 +369,81 @@ class WorkstationApp(ttk.Window):
         self._build_monitor(self.right_monitor)
 
         self.right_help = ttk.Frame(right)
-        self._build_help_panel(self.right_help)
 
         self.tabs.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
     def _build_connection_bar(self, parent: ttk.Frame) -> None:
         bar = ttk.Frame(parent)
         bar.pack(fill=tk.X)
-        ttk.Label(bar, text="通道").grid(row=0, column=0, sticky=tk.W)
-        ttk.Combobox(bar, textvariable=self.transport_var, values=("UART", "BLE"), width=7, state="readonly").grid(row=0, column=1, padx=(6, 10))
-        ttk.Label(bar, text="COM").grid(row=0, column=2, sticky=tk.W)
-        self.port_combo = ttk.Combobox(bar, textvariable=self.uart_port_var, width=12)
-        self.port_combo.grid(row=0, column=3, padx=(6, 8))
-        ttk.Label(bar, text="波特率").grid(row=0, column=4, sticky=tk.W)
-        ttk.Entry(bar, textvariable=self.baud_var, width=9).grid(row=0, column=5, padx=(6, 8))
-        ttk.Button(bar, text="刷新", command=self._refresh_ports, bootstyle="light").grid(row=0, column=6, padx=(0, 12))
-        ttk.Label(bar, text="BLE 名").grid(row=0, column=7, sticky=tk.W)
-        ttk.Entry(bar, textvariable=self.ble_name_var, width=14).grid(row=0, column=8, padx=(6, 8))
-        ttk.Label(bar, text="地址").grid(row=0, column=9, sticky=tk.W)
-        ttk.Entry(bar, textvariable=self.ble_addr_var, width=20).grid(row=0, column=10, padx=(6, 12))
-        ttk.Button(bar, text="连接", command=self._connect, bootstyle="success").grid(row=0, column=11, padx=(0, 6))
-        ttk.Button(bar, text="断开", command=self._disconnect, bootstyle="secondary").grid(row=0, column=12, padx=(0, 12))
+
+        row0 = ttk.Frame(bar)
+        row0.pack(fill=tk.X)
+        ttk.Label(row0, text="通道").pack(side=tk.LEFT)
+        ttk.Combobox(row0, textvariable=self.transport_var, values=("UART", "BLE"), width=7, state="readonly").pack(side=tk.LEFT, padx=(6, 16))
+        ttk.Label(row0, text="COM").pack(side=tk.LEFT)
+        self.port_combo = ttk.Combobox(row0, textvariable=self.uart_port_var, width=12)
+        self.port_combo.pack(side=tk.LEFT, padx=(6, 16))
+        ttk.Label(row0, text="波特率").pack(side=tk.LEFT)
+        ttk.Entry(row0, textvariable=self.baud_var, width=10).pack(side=tk.LEFT, padx=(6, 16))
+        ttk.Label(row0, text="BLE 名").pack(side=tk.LEFT)
+        ttk.Entry(row0, textvariable=self.ble_name_var, width=13).pack(side=tk.LEFT, padx=(6, 16))
+        ttk.Label(row0, text="地址").pack(side=tk.LEFT)
+        ttk.Entry(row0, textvariable=self.ble_addr_var, width=24).pack(side=tk.LEFT, padx=(6, 0))
+
+        row2 = ttk.Frame(bar)
+        row2.pack(fill=tk.X, pady=(8, 0))
+        tk.Button(
+            row2,
+            text="刷新",
+            command=self._refresh_ports,
+            width=8,
+            font=("Microsoft YaHei UI", 10),
+            bg="#EEF2F5",
+            fg="#4B5563",
+            relief=tk.FLAT,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(
+            row2,
+            text="连接",
+            command=self._connect,
+            width=14,
+            font=("Microsoft YaHei UI", 11, "bold"),
+            bg="#1ABC9C",
+            fg="#FFFFFF",
+            activebackground="#16A085",
+            activeforeground="#FFFFFF",
+            relief=tk.FLAT,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(
+            row2,
+            text="断开",
+            command=self._disconnect,
+            width=8,
+            font=("Microsoft YaHei UI", 10),
+            bg="#95A5A6",
+            fg="#FFFFFF",
+            activebackground="#7F8C8D",
+            activeforeground="#FFFFFF",
+            relief=tk.FLAT,
+        ).pack(side=tk.LEFT, padx=(0, 8))
         self.connection_status_label = tk.Label(
-            bar,
+            row2,
             textvariable=self.transport_label,
             font=("Microsoft YaHei UI", 11, "bold"),
             fg="#FFFFFF",
             bg="#6B7280",
-            padx=16,
-            pady=6,
+            padx=8,
+            pady=4,
             relief=tk.SOLID,
             borderwidth=1,
-            width=28,
+            width=10 if self.compact_layout else 12,
             anchor=tk.CENTER,
         )
-        self.connection_status_label.grid(row=0, column=13, sticky=tk.W)
-        bar.columnconfigure(14, weight=1)
+        self.connection_status_label.pack(side=tk.LEFT)
         self._set_connection_status("DISCONNECTED", "未连接")
 
     def _build_run_tab(self, tabs: ttk.Notebook) -> None:
-        frame = ttk.Frame(tabs, padding=10)
-        tabs.add(frame, text="工厂操作")
+        _, frame = self._add_scrollable_tab(tabs, "工厂操作")
 
         ttk.Label(frame, text="DUT", style="Title.TLabel").grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 8))
         ttk.Label(frame, text="SN").grid(row=1, column=0, sticky=tk.W)
@@ -274,17 +472,25 @@ class WorkstationApp(ttk.Window):
         self.full_btn.grid(row=9, column=0, columnspan=2, sticky=tk.EW, pady=5)
         ttk.Button(frame, text="OTA 升级", bootstyle="warning", command=self._run_ota).grid(row=10, column=0, columnspan=2, sticky=tk.EW, pady=5)
 
-        ttk.Separator(frame).grid(row=11, column=0, columnspan=2, sticky=tk.EW, pady=12)
-        ttk.Label(frame, text="工程调试", style="Title.TLabel").grid(row=12, column=0, columnspan=2, sticky=tk.W, pady=(0, 8))
+        ttk.Label(frame, textvariable=self.half_flash_status_var, wraplength=300, foreground="#6B7280").grid(
+            row=11,
+            column=0,
+            columnspan=2,
+            sticky=tk.W,
+            pady=(4, 0),
+        )
+
+        ttk.Separator(frame).grid(row=12, column=0, columnspan=2, sticky=tk.EW, pady=12)
+        ttk.Label(frame, text="工程调试", style="Title.TLabel").grid(row=13, column=0, columnspan=2, sticky=tk.W, pady=(0, 8))
         self.manual_cmd_var = tk.StringVar(value="AT")
         self.manual_entry = ttk.Entry(frame, textvariable=self.manual_cmd_var)
-        self.manual_entry.grid(row=13, column=0, columnspan=2, sticky=tk.EW, pady=3)
+        self.manual_entry.grid(row=14, column=0, columnspan=2, sticky=tk.EW, pady=3)
         self.manual_send_btn = ttk.Button(frame, text="发送 AT", bootstyle="primary", command=self._send_manual)
-        self.manual_send_btn.grid(row=14, column=0, sticky=tk.EW, pady=3)
+        self.manual_send_btn.grid(row=15, column=0, sticky=tk.EW, pady=3)
         self.probe_btn = ttk.Button(frame, text="探测 AT/VER", bootstyle="secondary", command=self._probe)
-        self.probe_btn.grid(row=14, column=1, sticky=tk.EW, padx=(6, 0), pady=3)
+        self.probe_btn.grid(row=15, column=1, sticky=tk.EW, padx=(6, 0), pady=3)
         ttk.Label(frame, textvariable=self.manual_hint_var, wraplength=300, foreground="#6B7280").grid(
-            row=15,
+            row=16,
             column=0,
             columnspan=2,
             sticky=tk.W,
@@ -292,6 +498,68 @@ class WorkstationApp(ttk.Window):
         )
         frame.columnconfigure(1, weight=1)
         self._sync_sn_controls()
+
+    def _build_flash_tab(self, tabs: ttk.Notebook) -> None:
+        outer, frame = self._add_scrollable_tab(tabs, "芯片烧录")
+        self.flash_tab = outer
+
+        ttk.Label(frame, text="J-Link 烧录", style="Title.TLabel").grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 8))
+        ttk.Label(frame, text="权限").grid(row=1, column=0, sticky=tk.W, pady=3)
+        ttk.Label(frame, textvariable=self.role_var, style="Status.TLabel").grid(row=1, column=1, sticky=tk.W, pady=3)
+        ttk.Label(frame, text="烧录方式").grid(row=2, column=0, sticky=tk.W, pady=3)
+        self.flash_backend_combo = ttk.Combobox(
+            frame,
+            textvariable=self.flash_backend_var,
+            values=("nrfjprog", "script"),
+            state="readonly",
+            width=16,
+        )
+        self.flash_backend_combo.grid(row=2, column=1, sticky=tk.EW, pady=3)
+        ttk.Label(frame, text="固件 hex").grid(row=3, column=0, sticky=tk.W, pady=3)
+        self.flash_image_entry = ttk.Entry(frame, textvariable=self.flash_image_var, width=34)
+        self.flash_image_entry.grid(row=3, column=1, sticky=tk.EW, pady=3)
+        self.flash_image_browse_btn = ttk.Button(frame, text="...", width=3, bootstyle="light", command=self._browse_flash_image)
+        self.flash_image_browse_btn.grid(row=3, column=2, padx=(5, 0), pady=3)
+        ttk.Label(frame, text="nrfjprog").grid(row=4, column=0, sticky=tk.W, pady=3)
+        self.nrfjprog_entry = ttk.Entry(frame, textvariable=self.nrfjprog_path_var, width=34)
+        self.nrfjprog_entry.grid(row=4, column=1, sticky=tk.EW, pady=3)
+        self.nrfjprog_browse_btn = ttk.Button(frame, text="...", width=3, bootstyle="light", command=self._browse_nrfjprog)
+        self.nrfjprog_browse_btn.grid(row=4, column=2, padx=(5, 0), pady=3)
+        ttk.Label(frame, text="J-Link ID").grid(row=5, column=0, sticky=tk.W, pady=3)
+        self.flash_jlink_entry = ttk.Entry(frame, textvariable=self.jlink_var, width=34)
+        self.flash_jlink_entry.grid(row=5, column=1, sticky=tk.EW, pady=3)
+        ttk.Label(frame, text="等待秒数").grid(row=6, column=0, sticky=tk.W, pady=3)
+        self.flash_wait_entry = ttk.Entry(frame, textvariable=self.flash_after_wait_var, width=12)
+        self.flash_wait_entry.grid(row=6, column=1, sticky=tk.W, pady=3)
+        self.flash_verify_check = ttk.Checkbutton(
+            frame,
+            text="烧录后校验",
+            variable=self.flash_verify_var,
+            bootstyle="round-toggle",
+        )
+        self.flash_verify_check.grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(4, 8))
+
+        self.flash_hash_var = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.flash_hash_var, wraplength=300, foreground="#6B7280").grid(
+            row=8,
+            column=0,
+            columnspan=3,
+            sticky=tk.W,
+            pady=(0, 8),
+        )
+
+        self.flash_run_btn = ttk.Button(frame, text="开始烧录", bootstyle="danger", command=self._run_flash)
+        self.flash_run_btn.grid(row=9, column=0, columnspan=3, sticky=tk.EW, pady=(8, 4))
+        self.flash_probe_btn = ttk.Button(frame, text="探测 J-Link", bootstyle="secondary", command=self._probe_jlink)
+        self.flash_probe_btn.grid(row=10, column=0, columnspan=3, sticky=tk.EW, pady=4)
+        ttk.Label(
+            frame,
+            text="独立烧录属于工程操作，需要工程师登录。半机测试前自动烧录在“设置”中启用。",
+            wraplength=300,
+            foreground="#6B7280",
+        ).grid(row=11, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
+        frame.columnconfigure(1, weight=1)
+        self._refresh_flash_text()
 
     def _build_ble_tab(self, tabs: ttk.Notebook) -> None:
         frame = ttk.Frame(tabs, padding=10)
@@ -331,31 +599,80 @@ class WorkstationApp(ttk.Window):
         self.ble_tree.pack(fill=tk.BOTH, expand=True)
 
     def _build_settings_tab(self, tabs: ttk.Notebook) -> None:
-        frame = ttk.Frame(tabs, padding=10)
-        self.settings_tab = frame
-        tabs.add(frame, text="设置")
+        outer, frame = self._add_scrollable_tab(tabs, "设置")
+        self.settings_tab = outer
+        self.settings_engineering_controls = []
         rows = [
-            ("固件仓库", self.firmware_repo_var, self._browse_repo),
-            ("烧录脚本", self.flash_script_var, self._browse_flash_script),
-            ("J-Link", self.jlink_var, None),
-            ("记录目录", self.records_root_var, self._browse_records),
-            ("OTA 包", self.ota_image_var, self._browse_ota_image),
-            ("SN 最小", self.sn_min_var, None),
-            ("SN 最大", self.sn_max_var, None),
-            ("SN 前缀", self.sn_prefix_var, None),
-            ("SN 正则", self.sn_regex_var, None),
+            ("固件仓库", self.firmware_repo_var, self._browse_repo, "firmware_repo"),
+            ("烧录脚本", self.flash_script_var, self._browse_flash_script, "flash_script"),
+            ("独立烧录固件", self.flash_image_var, self._browse_flash_image, "flash_image"),
+            ("半机烧录固件", self.half_flash_image_var, self._browse_half_flash_image, "half_flash_image"),
+            ("nrfjprog", self.nrfjprog_path_var, self._browse_nrfjprog, "nrfjprog"),
+            ("J-Link", self.jlink_var, None, "flash_jlink"),
+            ("烧录等待(s)", self.flash_after_wait_var, None, "flash_wait"),
+            ("记录目录", self.records_root_var, self._browse_records, None),
+            ("OTA 包", self.ota_image_var, self._browse_ota_image, None),
+            ("SN 最小", self.sn_min_var, None, None),
+            ("SN 最大", self.sn_max_var, None, None),
+            ("SN 前缀", self.sn_prefix_var, None, None),
+            ("SN 正则", self.sn_regex_var, None, None),
         ]
-        for row, (label, var, browse) in enumerate(rows):
+        for row, (label, var, browse, control_name) in enumerate(rows):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky=tk.W, pady=3)
-            ttk.Entry(frame, textvariable=var, width=34).grid(row=row, column=1, sticky=tk.EW, pady=3)
+            entry = ttk.Entry(frame, textvariable=var, width=34)
+            entry.grid(row=row, column=1, sticky=tk.EW, pady=3)
+            if control_name:
+                setattr(self, f"{control_name}_entry", entry)
+                self.settings_engineering_controls.append(entry)
             if browse:
-                ttk.Button(frame, text="...", width=3, bootstyle="light", command=browse).grid(row=row, column=2, padx=(5, 0), pady=3)
-        ttk.Button(frame, text="保存设置", bootstyle="success", command=self._save_settings).grid(row=len(rows), column=0, columnspan=3, sticky=tk.EW, pady=(12, 0))
+                button = ttk.Button(frame, text="...", width=3, bootstyle="light", command=browse)
+                button.grid(row=row, column=2, padx=(5, 0), pady=3)
+                if control_name:
+                    setattr(self, f"{control_name}_browse_btn", button)
+                    self.settings_engineering_controls.append(button)
+        flash_backend_row = len(rows)
+        ttk.Label(frame, text="烧录方式").grid(row=flash_backend_row, column=0, sticky=tk.W, pady=3)
+        self.settings_flash_backend_combo = ttk.Combobox(
+            frame,
+            textvariable=self.flash_backend_var,
+            values=("nrfjprog", "script"),
+            state="readonly",
+            width=34,
+        )
+        self.settings_flash_backend_combo.grid(row=flash_backend_row, column=1, sticky=tk.EW, pady=3)
+        self.settings_engineering_controls.append(self.settings_flash_backend_combo)
+        flash_option_row = flash_backend_row + 1
+        self.half_flash_before_test_check = ttk.Checkbutton(
+            frame,
+            text="半机测试前烧录",
+            variable=self.half_flash_before_test_var,
+            bootstyle="round-toggle",
+            command=self._refresh_flash_text,
+        )
+        self.half_flash_before_test_check.grid(row=flash_option_row, column=0, columnspan=2, sticky=tk.W, pady=(4, 2))
+        self.settings_engineering_controls.append(self.half_flash_before_test_check)
+        self.settings_flash_verify_check = ttk.Checkbutton(
+            frame,
+            text="烧录后校验",
+            variable=self.flash_verify_var,
+            bootstyle="round-toggle",
+        )
+        self.settings_flash_verify_check.grid(row=flash_option_row + 1, column=0, columnspan=2, sticky=tk.W, pady=(2, 8))
+        self.settings_engineering_controls.append(self.settings_flash_verify_check)
+        record_row = flash_option_row + 2
+        ttk.Label(frame, text="记录格式").grid(row=record_row, column=0, sticky=tk.W, pady=3)
+        ttk.Combobox(
+            frame,
+            textvariable=self.record_output_mode_var,
+            values=tuple(RECORD_OUTPUT_MODE_LABELS.values()),
+            state="readonly",
+            width=34,
+        ).grid(row=record_row, column=1, sticky=tk.EW, pady=3)
+        ttk.Button(frame, text="保存设置", bootstyle="success", command=self._save_settings).grid(row=record_row + 1, column=0, columnspan=3, sticky=tk.EW, pady=(12, 0))
         frame.columnconfigure(1, weight=1)
 
     def _build_more_tab(self, tabs: ttk.Notebook) -> None:
-        frame = ttk.Frame(tabs, padding=10)
-        tabs.add(frame, text="更多")
+        _, frame = self._add_scrollable_tab(tabs, "更多")
 
         ttk.Label(frame, text="工程权限", style="Title.TLabel").grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 8))
         ttk.Label(frame, text="当前权限").grid(row=1, column=0, sticky=tk.W)
@@ -391,6 +708,9 @@ class WorkstationApp(ttk.Window):
         text = self.tabs.tab(current, "text")
         if text == "更多":
             self.right_monitor.pack_forget()
+            if not self._help_panel_built:
+                self._build_help_panel(self.right_help)
+                self._help_panel_built = True
             self.right_help.pack(fill=tk.BOTH, expand=True)
         else:
             self.right_help.pack_forget()
@@ -566,31 +886,36 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
         at_text.configure(state=tk.DISABLED)
 
     def _build_monitor(self, parent: ttk.Frame) -> None:
-        ttk.Label(parent, text="执行步骤", style="Title.TLabel").pack(anchor=tk.W)
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=3)
+        parent.rowconfigure(3, weight=2)
+
+        ttk.Label(parent, text="执行步骤", style="Title.TLabel").grid(row=0, column=0, sticky=tk.W)
         step_frame = ttk.Frame(parent)
-        step_frame.pack(fill=tk.BOTH, expand=True, pady=(6, 5))
+        step_frame.grid(row=1, column=0, sticky=tk.NSEW, pady=(6, 5))
         self.step_tree = ttk.Treeview(
             step_frame,
             columns=("idx", "step", "status", "detail"),
             show="headings",
             style="Step.Treeview",
+            height=7 if self.compact_layout else 10,
         )
-        for col, title, width in (
-            ("idx", "#", 44),
-            ("step", "步骤", 300),
-            ("status", "状态", 100),
-            ("detail", "详情", 540),
+        for col, title in (
+            ("idx", "#"),
+            ("step", "步骤"),
+            ("status", "状态"),
+            ("detail", "详情"),
         ):
             self.step_tree.heading(col, text=title)
-            self.step_tree.column(col, width=width, stretch=(col == "detail"))
-        self.step_tree.bind("<Configure>", lambda _e: self._refresh_step_status_labels())
-        self.step_tree.bind("<ButtonRelease-1>", lambda _e: self._refresh_step_status_labels())
-        self.step_tree.bind("<KeyRelease>", lambda _e: self._refresh_step_status_labels())
-        self.step_tree.bind("<MouseWheel>", lambda _e: self._refresh_step_status_labels())
+        self._configure_step_tree_columns()
+        self.step_tree.bind("<Configure>", lambda _e: self._on_step_tree_configure())
+        self.step_tree.bind("<ButtonRelease-1>", lambda _e: self._schedule_step_status_refresh())
+        self.step_tree.bind("<KeyRelease>", lambda _e: self._schedule_step_status_refresh())
+        self.step_tree.bind("<MouseWheel>", lambda _e: self._schedule_step_status_refresh())
         self.step_tree.pack(fill=tk.BOTH, expand=True)
 
         log_header = ttk.Frame(parent)
-        log_header.pack(fill=tk.X, pady=(10, 0))
+        log_header.grid(row=2, column=0, sticky=tk.EW, pady=(8, 0))
         ttk.Label(log_header, text="AT 日志", style="Title.TLabel").pack(side=tk.LEFT, anchor=tk.W)
         ttk.Button(
             log_header,
@@ -600,8 +925,14 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
             bootstyle="secondary-outline",
         ).pack(side=tk.RIGHT)
         log_frame = ttk.Frame(parent)
-        log_frame.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
-        self.log_text = tk.Text(log_frame, height=18, wrap=tk.NONE, font=("Consolas", 10))
+        log_frame.grid(row=3, column=0, sticky=tk.NSEW, pady=(6, 0))
+        self.log_text = tk.Text(
+            log_frame,
+            height=7 if self.compact_layout else 12,
+            width=42 if self.compact_layout else 50,
+            wrap=tk.NONE,
+            font=("Consolas", 10),
+        )
         yscroll = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
         xscroll = ttk.Scrollbar(log_frame, orient=tk.HORIZONTAL, command=self.log_text.xview)
         self.log_text.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
@@ -633,30 +964,34 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
         self._set_busy(True)
         threading.Thread(target=self._connect_worker, daemon=True).start()
 
+    def _make_client_from_current_settings(self, line_callback) -> tuple[ATClient, str, str]:
+        mode = self.transport_var.get().upper()
+        if mode == "BLE":
+            ble_name = self.ble_name_var.get().strip() or "AXI-P1-T"
+            ble_addr = self.ble_addr_var.get().strip()
+            backend = self.ble_scan_backend_var.get().strip() or "nrf_dongle"
+            transport = BLENusTransport(
+                ble_name,
+                ble_addr,
+                backend=backend,
+                dongle_port=self.ble_dongle_port_var.get().strip() or "COM8",
+                nrf_connect_ble_path=self.nrf_connect_ble_path_var.get().strip(),
+                dongle_sd_version=self.ble_dongle_sd_var.get().strip() or "auto",
+            )
+            label = f"{ble_name} {ble_addr}".strip()
+        else:
+            mode = "UART"
+            port = self.uart_port_var.get().strip()
+            if not port:
+                raise RuntimeError("UART port is empty")
+            baudrate = int(self.baud_var.get().strip() or "115200")
+            transport = UARTTransport(port, baudrate)
+            label = f"{port}@{baudrate}"
+        return ATClient(transport, line_callback), mode, label
+
     def _connect_worker(self) -> None:
         try:
-            mode = self.transport_var.get().upper()
-            if mode == "BLE":
-                ble_name = self.ble_name_var.get().strip() or "AXI-P1-T"
-                ble_addr = self.ble_addr_var.get().strip()
-                backend = self.ble_scan_backend_var.get().strip() or "nrf_dongle"
-                transport = BLENusTransport(
-                    ble_name,
-                    ble_addr,
-                    backend=backend,
-                    dongle_port=self.ble_dongle_port_var.get().strip() or "COM8",
-                    nrf_connect_ble_path=self.nrf_connect_ble_path_var.get().strip(),
-                    dongle_sd_version=self.ble_dongle_sd_var.get().strip() or "auto",
-                )
-                label = f"{ble_name} {ble_addr}".strip()
-            else:
-                port = self.uart_port_var.get().strip()
-                if not port:
-                    raise RuntimeError("UART port is empty")
-                baudrate = int(self.baud_var.get().strip() or "115200")
-                transport = UARTTransport(port, baudrate)
-                label = f"{port}@{baudrate}"
-            client = ATClient(transport, self._line_callback)
+            client, mode, label = self._make_client_from_current_settings(self._line_callback)
             self.events.put(("connected", client, mode, label))
         except Exception as exc:
             self.events.put(("log", "ERR", f"连接失败: {exc}"))
@@ -694,10 +1029,10 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
     def _set_connection_status(self, state: str, detail: str) -> None:
         state_key = state.upper()
         if state_key == "UART":
-            text = f"UART 已连接  {detail}"
+            text = "UART 已连接"
             bg = "#008F3A"
         elif state_key == "BLE":
-            text = f"BLE 已连接  {detail}"
+            text = "BLE 已连接"
             bg = "#006DFF"
         elif state_key == "CONNECTING":
             text = detail or "连接中..."
@@ -712,12 +1047,188 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
     def _probe(self) -> None:
         self._run_commands([("AT probe", "AT"), ("Read version", "AT+VER?")])
 
+    def _half_flash_config(self) -> WorkstationConfig:
+        return replace(self.config_model, flash_image_path=self.config_model.half_flash_image_path)
+
+    def _validate_flash_ready(self, config: WorkstationConfig | None = None, *, half_flow: bool = False) -> bool:
+        cfg = config or self.config_model
+        image = str(cfg.flash_image_path or "").strip()
+        backend = str(cfg.flash_backend or "nrfjprog").strip() or "nrfjprog"
+        image_label = "半机烧录固件" if half_flow else "烧录固件"
+        if backend == "nrfjprog":
+            if not image:
+                messagebox.showerror(f"缺少{image_label}", f"请先在设置中选择{image_label} merged.hex。")
+                return False
+            if not Path(image).exists():
+                messagebox.showerror(f"{image_label}不存在", f"找不到{image_label}：\n{image}")
+                return False
+        elif backend == "script":
+            script = str(cfg.flash_script_path or "").strip()
+            if not script or not Path(script).exists():
+                messagebox.showerror("烧录脚本不存在", f"找不到烧录脚本：\n{script}")
+                return False
+        else:
+            messagebox.showerror("烧录方式无效", f"不支持的烧录方式：{backend}")
+            return False
+        precheck = precheck_flash_request(
+            cfg,
+            sn_enabled=bool(self.sn_enabled_var.get()),
+            dry_run=not bool(self.sn_enabled_var.get()),
+        )
+        if precheck.level == "WARN":
+            self._log("WARN", f"烧录预检: {precheck.message}")
+            if not messagebox.askyesno("烧录预检警告", f"{precheck.message}\n\n是否继续？"):
+                return False
+        if not precheck.ok:
+            messagebox.showerror("烧录预检失败", precheck.message)
+            self._log("ERR", f"烧录预检失败: {precheck.message}")
+            return False
+        return True
+
+    def _flash_payload(self, outcome: FlashOutcome | None = None) -> dict:
+        return flash_payload(self.config_model, outcome)
+
+    def _run_flash(self) -> None:
+        if self.busy:
+            return
+        if not self.engineering_mode:
+            messagebox.showwarning("需要工程登录", "芯片烧录属于工程操作，请先在“更多”中工程登录。")
+            return
+        self._save_settings(silent=True)
+        if not self._validate_flash_ready():
+            return
+        image_name = Path(self.config_model.flash_image_path).name if self.config_model.flash_image_path else "未选择"
+        if not messagebox.askyesno("确认芯片烧录", f"即将烧录固件：{image_name}\n\n烧录会复位设备，是否继续？"):
+            return
+        self._close_client_for_flash()
+        self._set_busy(True)
+
+        def worker() -> None:
+            try:
+                def flash_log(direction: str, line: str) -> None:
+                    self.events.put(("log", direction, line))
+
+                outcome = run_flash(self.config_model, flash_log)
+                level = "OK" if outcome.ok else "ERR"
+                self.events.put(("log", level, f"芯片烧录 {outcome.result}: {outcome.message} ({outcome.elapsed_ms} ms)"))
+                if outcome.ok and self.config_model.flash_after_wait_s > 0:
+                    time.sleep(max(0.0, float(self.config_model.flash_after_wait_s)))
+            except Exception as exc:
+                self.events.put(("log", "ERR", f"芯片烧录失败: {exc}"))
+            finally:
+                self.events.put(("busy", False))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _probe_jlink(self) -> None:
+        if self.busy:
+            return
+        if not self.engineering_mode:
+            messagebox.showwarning("需要工程登录", "J-Link 探测属于工程操作，请先在“更多”中工程登录。")
+            return
+        self._save_settings(silent=True)
+        self._set_busy(True)
+
+        def worker() -> None:
+            try:
+                tool = self.config_model.nrfjprog_path or "nrfjprog"
+                proc = subprocess.run(
+                    [tool, "--ids"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=15,
+                )
+                output = (proc.stdout or proc.stderr or "").strip()
+                level = "OK" if proc.returncode == 0 else "ERR"
+                self.events.put(("log", level, f"nrfjprog --ids exit={proc.returncode} {output}"))
+            except Exception as exc:
+                self.events.put(("log", "ERR", f"J-Link 探测失败: {exc}"))
+            finally:
+                self.events.put(("busy", False))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _close_client_for_flash(self) -> None:
+        client = self.client
+        self.client = None
+        if client is not None:
+            try:
+                client.close()
+            except Exception as exc:
+                self.events.put(("log", "WARN", f"烧录前关闭连接失败: {exc}"))
+        self.events.put(("connection_status", "DISCONNECTED", "烧录期间断开"))
+
+    def _run_flash_for_flow(self, record, progress) -> FlashOutcome:
+        def flash_log(direction: str, line: str) -> None:
+            self.events.put(("log", direction, line))
+
+        return record_flash_step(
+            self._half_flash_config(),
+            record,
+            progress,
+            run_flash,
+            step_index=1,
+            line_callback=flash_log,
+        )
+
+    def _reconnect_after_flash(self, record, line_cb, progress) -> ATClient | None:
+        label = "Flash reconnect"
+        progress(2, label, "RUN", self.transport_var.get().upper() or "UART")
+        started = time.monotonic()
+        try:
+            client, mode, detail = self._make_client_from_current_settings(line_cb)
+            self.client = client
+            self.events.put(("connected", client, mode, detail))
+            ok, elapsed_ms, summary, reason, _results = probe_at_client(client)
+            record.log_item(
+                "half",
+                label,
+                "AT;AT+VER?",
+                "PASS" if ok else "NG",
+                elapsed_ms,
+                reason,
+                summary,
+            )
+            progress(2, label, "PASS" if ok else "NG", summary or f"{elapsed_ms / 1000:.1f}s")
+            return client if ok else None
+        except Exception as exc:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            record.log_item("half", label, "connect", "NG", elapsed_ms, str(exc), "")
+            progress(2, label, "NG", str(exc))
+            return None
+
     def _runtime_token_for_flow(self) -> str:
         return get_factory_token("")
 
     def _sync_auth_status(self) -> None:
         has_token = bool(self._runtime_token_for_flow())
         self.auth_status_var.set("已配置" if has_token else "未配置")
+
+    def _refresh_flash_text(self) -> None:
+        image_text = self.flash_image_var.get().strip()
+        half_image_text = self.half_flash_image_var.get().strip()
+        image_name = Path(image_text).name if image_text else "未选择"
+        half_image_name = Path(half_image_text).name if half_image_text else "未选择"
+        if self.half_flash_before_test_var.get():
+            self.half_flash_status_var.set(f"半机测试前烧录：开启，固件 {half_image_name}")
+        else:
+            self.half_flash_status_var.set("半机测试前烧录：关闭")
+        hash_text = ""
+        if image_text and Path(image_text).exists():
+            try:
+                digest = file_sha256(image_text)
+                size = Path(image_text).stat().st_size
+                hash_text = f"固件：{image_name} | size={size} | sha256={digest[:12]}..."
+            except Exception as exc:
+                hash_text = f"固件：{image_name} | hash 读取失败：{exc}"
+        elif image_text:
+            hash_text = f"固件不存在：{image_text}"
+        else:
+            hash_text = "尚未选择烧录固件"
+        if hasattr(self, "flash_hash_var"):
+            self.flash_hash_var.set(hash_text)
 
     def _apply_access_state(self) -> None:
         self.role_var.set("工程模式" if self.engineering_mode else "操作员模式")
@@ -735,7 +1246,27 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
         if hasattr(self, "probe_btn"):
             self.probe_btn.configure(state=debug_state)
         if hasattr(self, "tabs") and hasattr(self, "settings_tab"):
-            self.tabs.tab(self.settings_tab, state=tk.NORMAL if self.engineering_mode else tk.DISABLED)
+            self.tabs.tab(self.settings_tab, state=tk.NORMAL)
+        flash_state = tk.NORMAL if self.engineering_mode and not self.busy else tk.DISABLED
+        for name in (
+            "flash_run_btn",
+            "flash_probe_btn",
+            "flash_backend_combo",
+            "flash_image_entry",
+            "flash_image_browse_btn",
+            "nrfjprog_entry",
+            "nrfjprog_browse_btn",
+            "flash_jlink_entry",
+            "flash_wait_entry",
+            "flash_verify_check",
+        ):
+            if hasattr(self, name):
+                control = getattr(self, name)
+                enabled_state = "readonly" if isinstance(control, ttk.Combobox) else tk.NORMAL
+                control.configure(state=enabled_state if flash_state == tk.NORMAL else tk.DISABLED)
+        for control in getattr(self, "settings_engineering_controls", []):
+            enabled_state = "readonly" if isinstance(control, ttk.Combobox) else tk.NORMAL
+            control.configure(state=enabled_state if flash_state == tk.NORMAL else tk.DISABLED)
         self.manual_hint_var.set(
             "工程模式：允许手动发送 AT 指令，危险操作会写入 AT 日志。"
             if self.engineering_mode
@@ -824,9 +1355,14 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
         threading.Thread(target=worker, daemon=True).start()
 
     def _run_flow(self, kind: str) -> None:
-        if not self._ensure_client() or self.busy:
+        if self.busy:
             return
         self._save_settings(silent=True)
+        auto_flash = kind == "half" and self.config_model.half_flash_before_test
+        if auto_flash and not self._validate_flash_ready(self._half_flash_config(), half_flow=True):
+            return
+        if not auto_flash and not self._ensure_client():
+            return
         sn_enabled = self.sn_enabled_var.get()
         sn = self.sn_var.get().strip() if sn_enabled else ""
         token = self._runtime_token_for_flow()
@@ -856,9 +1392,12 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
                 )
                 return
         else:
+            message = "当前未启用 SN/记录，本次测试不会写入 SN，也不会保存 CSV/测试记录。"
+            if auto_flash:
+                message += "\n\n注意：本次半机测试会先执行芯片烧录。"
             if not messagebox.askyesno(
                 "确认空跑测试",
-                "当前未启用 SN/记录，本次测试不会写入 SN，也不会保存 CSV/测试记录。\n\n是否继续？",
+                f"{message}\n\n是否继续？",
             ):
                 return
         self._clear_steps()
@@ -873,7 +1412,10 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
             station = "HALF" if kind == "half" else "FULL"
             if sn_enabled:
                 try:
-                    storage = RunStorage(self.config_model.records_root)
+                    storage = RunStorage(
+                        self.config_model.records_root,
+                        write_extra_files=self.config_model.write_extra_record_files(),
+                    )
                     record = storage.start_run(station, sn, self.config_model.dut_alias)
                 except Exception as exc:
                     self.events.put(("log", "ERR", f"记录保存失败: {exc}"))
@@ -915,7 +1457,29 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
                 if block_flow:
                     done.wait()
 
-            self.client.set_line_callback(line_cb)  # type: ignore[union-attr]
+            flow_start_index = 1
+            if kind == "half" and self.config_model.half_flash_before_test:
+                self._close_client_for_flash()
+                flash_outcome = self._run_flash_for_flow(record, progress)
+                if not flash_outcome.ok:
+                    record.finish("NG", f"flash failed: {flash_outcome.message}")
+                    self.events.put(("flow_done", FlowOutcome(False, "NG", f"flash failed: {flash_outcome.message}", [])))
+                    return
+                wait_s = max(0.0, float(self.config_model.flash_after_wait_s))
+                if wait_s > 0:
+                    self.events.put(("log", "INFO", f"烧录完成，等待设备启动 {wait_s:.1f}s"))
+                    time.sleep(wait_s)
+                client = self._reconnect_after_flash(record, line_cb, progress)
+                if client is None:
+                    record.finish("NG", "flash reconnect failed")
+                    self.events.put(("flow_done", FlowOutcome(False, "NG", "flash reconnect failed", [])))
+                    return
+                flow_start_index = 3
+            else:
+                if self.client is None:
+                    raise RuntimeError("device is not connected")
+                self.client.set_line_callback(line_cb)
+
             if kind == "half":
                 outcome = run_half_machine(
                     self.client,
@@ -926,6 +1490,7 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
                     progress,
                     sn_enabled=sn_enabled,
                     before_step=before_step,
+                    start_index=flow_start_index,
                 )  # type: ignore[arg-type]
             else:
                 outcome = run_full_machine(
@@ -937,6 +1502,7 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
                     progress,
                     sn_enabled=sn_enabled,
                     before_step=before_step,
+                    start_index=flow_start_index,
                 )  # type: ignore[arg-type]
             self.events.put(("flow_done", outcome))
         except Exception as exc:
@@ -950,7 +1516,7 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
                 "popup",
                 "error",
                 "流程异常",
-                "测试流程异常中断。\n\n请检查设备连接、COM 口或 BLE 连接后重新测试。",
+                f"测试流程异常中断。\n\n错误摘要：{exc}\n\n请检查设备连接、COM 口或 BLE 连接后重新测试。",
             ))
         finally:
             if self.client is not None:
@@ -1077,20 +1643,6 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
                 5,
                 "",
             )
-        if label == "LRA vibcapture":
-            return (
-                "准备采集震动数据",
-                "即将采集 3 秒 LRA 震动数据。\n\n请将设备放稳，采集期间不要移动。",
-                0,
-                "开始采集",
-            )
-        if label == "PPG reflect capture":
-            return (
-                "准备采集 PPG 数据",
-                "即将采集 3 秒 PPG 数据。\n\n请按当前测试要求放置设备，采集期间不要移动。",
-                0,
-                "开始采集",
-            )
         return None
 
     def _show_operator_prompt(self, title: str, message: str, seconds: int, button_text: str, block_flow: bool = True) -> None:
@@ -1193,7 +1745,8 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
             messagebox.showerror(
                 "设备未解锁",
                 "设备处于工厂锁定状态，无法执行硬件测试。\n\n"
-                "请确认运行 token 是否正确，或联系工程人员解锁。",
+                "请确认运行 token 是否与设备端一致，注意连字符 '-' 和下划线 '_' 不同。\n\n"
+                "如仍失败，请联系工程人员解锁。",
             )
             return
         failed = self._failed_step_names()
@@ -1208,6 +1761,7 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
         state = tk.DISABLED if busy else tk.NORMAL
         for button in (self.half_btn, self.full_btn):
             button.configure(state=state)
+        self._apply_access_state()
 
     def _clear_steps(self) -> None:
         for item in self.step_tree.get_children():
@@ -1216,8 +1770,23 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
             label.destroy()
         self.step_status_labels.clear()
         self.step_status_state.clear()
+        if self._step_status_refresh_job is not None:
+            try:
+                self.after_cancel(self._step_status_refresh_job)
+            except tk.TclError:
+                pass
+            self._step_status_refresh_job = None
+
+    def _schedule_step_status_refresh(self, delay_ms: int = 25) -> None:
+        if self._step_status_refresh_job is not None:
+            try:
+                self.after_cancel(self._step_status_refresh_job)
+            except tk.TclError:
+                pass
+        self._step_status_refresh_job = self.after(delay_ms, self._refresh_step_status_labels)
 
     def _refresh_step_status_labels(self) -> None:
+        self._step_status_refresh_job = None
         for iid, (display_status, status_key) in list(self.step_status_state.items()):
             if not self.step_tree.exists(iid):
                 label = self.step_status_labels.pop(iid, None)
@@ -1258,7 +1827,7 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
         else:
             self.step_tree.insert("", tk.END, iid=iid, values=values)
         self.step_tree.see(iid)
-        self._refresh_step_status_labels()
+        self._schedule_step_status_refresh()
         if step in MOMO_TOUCH_STEPS and status_key in {"PASS", "OK"}:
             self._close_active_momo_prompt()
 
@@ -1339,9 +1908,22 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
         cfg.sn_enabled = self.sn_enabled_var.get()
         cfg.dut_alias = self.dut_alias_var.get().strip()
         cfg.records_root = self.records_root_var.get().strip()
+        cfg.record_output_mode = _record_output_mode(self.record_output_mode_var.get())
         cfg.ota_image_path = self.ota_image_var.get().strip()
         cfg.firmware_repo = self.firmware_repo_var.get().strip()
         cfg.flash_script_path = self.flash_script_var.get().strip()
+        cfg.half_flash_before_test = self.half_flash_before_test_var.get()
+        cfg.flash_backend = self.flash_backend_var.get().strip() or "nrfjprog"
+        cfg.flash_image_path = self.flash_image_var.get().strip()
+        cfg.half_flash_image_path = self.half_flash_image_var.get().strip()
+        cfg.nrfjprog_path = self.nrfjprog_path_var.get().strip() or "nrfjprog"
+        try:
+            cfg.flash_after_wait_s = float(self.flash_after_wait_var.get().strip() or "8")
+        except ValueError:
+            if not silent:
+                messagebox.showerror("设置错误", "烧录等待秒数必须是数字")
+            return
+        cfg.flash_verify = self.flash_verify_var.get()
         cfg.jlink_probe_id = self.jlink_var.get().strip()
         try:
             cfg.sn_rule.min_len = int(self.sn_min_var.get().strip() or "1")
@@ -1354,6 +1936,7 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
         cfg.sn_rule.regex = self.sn_regex_var.get().strip()
         save_config(cfg)
         self._sync_auth_status()
+        self._refresh_flash_text()
         if not silent:
             self._log("OK", "设置已保存")
 
@@ -1371,6 +1954,23 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
         path = filedialog.askopenfilename(filetypes=(("PowerShell", "*.ps1"), ("All files", "*.*")))
         if path:
             self.flash_script_var.set(path)
+
+    def _browse_flash_image(self) -> None:
+        path = filedialog.askopenfilename(filetypes=(("HEX firmware", "*.hex"), ("All files", "*.*")))
+        if path:
+            self.flash_image_var.set(path)
+            self._refresh_flash_text()
+
+    def _browse_half_flash_image(self) -> None:
+        path = filedialog.askopenfilename(filetypes=(("HEX firmware", "*.hex"), ("All files", "*.*")))
+        if path:
+            self.half_flash_image_var.set(path)
+            self._refresh_flash_text()
+
+    def _browse_nrfjprog(self) -> None:
+        path = filedialog.askopenfilename(filetypes=(("nrfjprog", "nrfjprog.exe"), ("Executable", "*.exe"), ("All files", "*.*")))
+        if path:
+            self.nrfjprog_path_var.set(path)
 
     def _browse_ota_image(self) -> None:
         path = filedialog.askopenfilename(filetypes=(("DFU package", "*.zip"), ("All files", "*.*")))

@@ -98,6 +98,14 @@ def redact_sensitive_text(text: str) -> str:
 class WorkstationConfig:
     firmware_repo: str = str(FIRMWARE_REPO)
     flash_script_path: str = str(FIRMWARE_REPO / "flash_poc3a.ps1")
+    half_flash_before_test: bool = False
+    flash_backend: str = "nrfjprog"
+    flash_image_path: str = str(FIRMWARE_REPO / "build_ondemand" / "merged.hex")
+    half_flash_image_path: str = str(FIRMWARE_REPO / "build_ondemand" / "merged.hex")
+    flash_after_wait_s: float = 8.0
+    flash_timeout_s: float = 180.0
+    flash_verify: bool = True
+    nrfjprog_path: str = "nrfjprog"
     jlink_probe_id: str = ""
     uart_port: str = ""
     uart_baudrate: int = 460800
@@ -116,6 +124,7 @@ class WorkstationConfig:
     station_id: str = "DEV"
     sn_enabled: bool = True
     capture_output_mode: str = "compact"
+    record_output_mode: str = "unified"
     factory_at_required: bool = True
     engineer_password_sha256: str = ""
     sn_rule: SNRule = field(default_factory=SNRule)
@@ -131,6 +140,8 @@ class WorkstationConfig:
                 cfg.at_timeouts = ATTimeouts(**{**asdict(cfg.at_timeouts), **value})
             elif hasattr(cfg, key):
                 setattr(cfg, key, value)
+        if "half_flash_image_path" not in data and "flash_image_path" in data:
+            cfg.half_flash_image_path = str(data.get("flash_image_path") or "")
         return cfg
 
     def to_dict(self) -> dict[str, Any]:
@@ -141,6 +152,9 @@ class WorkstationConfig:
 
     def validate_sn(self, sn: str) -> tuple[bool, str]:
         return self.sn_rule.validate(sn)
+
+    def write_extra_record_files(self) -> bool:
+        return str(self.record_output_mode).strip().lower() == "split"
 
 
 def _dotenv_values(path: Path | None = None) -> dict[str, str]:
@@ -202,13 +216,37 @@ def _resolve_path_field(value: str, base_dir: Path) -> str:
     return str(path if path.is_absolute() else base_dir / path)
 
 
+def _resolve_tool_or_path_field(value: str, base_dir: Path) -> str:
+    if not value:
+        return value
+    path = Path(value)
+    if path.is_absolute():
+        return str(path)
+    text = str(value)
+    if any(sep in text for sep in ("\\", "/")) or text.startswith("."):
+        return str(base_dir / path)
+    return value
+
+
 def _resolve_config_paths(config: WorkstationConfig, base_dir: Path) -> WorkstationConfig:
     config.firmware_repo = _resolve_path_field(config.firmware_repo, base_dir)
     config.flash_script_path = _resolve_path_field(config.flash_script_path, base_dir)
+    config.flash_image_path = _resolve_path_field(config.flash_image_path, base_dir)
+    config.half_flash_image_path = _resolve_path_field(config.half_flash_image_path, base_dir)
+    config.nrfjprog_path = _resolve_tool_or_path_field(config.nrfjprog_path, base_dir)
     config.ota_image_path = _resolve_path_field(config.ota_image_path, base_dir)
     config.records_root = _resolve_path_field(config.records_root, base_dir)
     config.nrf_connect_ble_path = _resolve_path_field(config.nrf_connect_ble_path, base_dir)
     return config
+
+
+def _read_config_text(path: Path) -> str:
+    raw = path.read_bytes()
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        return raw.decode("utf-16")
+    if len(raw) >= 2 and raw[0] == ord("{") and raw[1] == 0:
+        return raw.decode("utf-16-le")
+    return raw.decode("utf-8-sig")
 
 
 def load_config(path: Path = CONFIG_PATH) -> WorkstationConfig:
@@ -216,7 +254,7 @@ def load_config(path: Path = CONFIG_PATH) -> WorkstationConfig:
     base_dir = path.resolve().parent
     if not path.exists():
         return _resolve_config_paths(WorkstationConfig(), base_dir)
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(_read_config_text(path))
     if not isinstance(data, dict):
         raise ValueError(f"Config must be a JSON object: {path}")
     return _resolve_config_paths(WorkstationConfig.from_dict(data), base_dir)

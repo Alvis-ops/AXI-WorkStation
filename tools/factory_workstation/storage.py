@@ -50,36 +50,48 @@ class CsvSink:
 
 
 class RunRecord:
-    def __init__(self, run_dir: Path, station: str, sn: str, dut_alias: str = "") -> None:
+    def __init__(
+        self,
+        run_dir: Path,
+        station: str,
+        sn: str,
+        dut_alias: str = "",
+        write_extra_files: bool = False,
+    ) -> None:
         self.run_dir = run_dir
         self.station = station
         self.sn = sn
         self.dut_alias = dut_alias
         self.run_id = run_dir.name
+        self.write_extra_files = write_extra_files
         self._started_monotonic = time.monotonic()
         self._event_index = 0
         self._step_index = ""
         self._step_name = ""
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        self.raw_log = (self.run_dir / "raw_at.log").open("a", encoding="utf-8")
+        self.raw_log = (self.run_dir / "raw_at.log").open("a", encoding="utf-8") if self.write_extra_files else None
         self.sinks: dict[str, CsvSink] = {}
         self.meta = {
+            "run_id": self.run_id,
             "station": station,
             "sn": sn,
             "dut_alias": dut_alias,
             "started_at": datetime.now().isoformat(timespec="seconds"),
             "run_dir": str(run_dir),
         }
-        (self.run_dir / "metadata.json").write_text(
-            json.dumps(self.meta, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
+        if self.write_extra_files:
+            (self.run_dir / "metadata.json").write_text(
+                json.dumps(self.meta, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+        self.log_event("run_metadata", self.meta)
         self.log_event("flow_start", {"station": station, "sn": sn, "dut_alias": dut_alias})
 
     def log_at(self, direction: str, line: str) -> None:
         logged_line = redact_sensitive_text(line) if direction == "TX" else line
-        self.raw_log.write(f"{_iso()} {direction} {logged_line}\n")
-        self.raw_log.flush()
+        if self.raw_log is not None:
+            self.raw_log.write(f"{_iso()} {direction} {logged_line}\n")
+            self.raw_log.flush()
         event_type = {"TX": "at_tx", "RX": "at_rx"}.get(direction, direction.lower())
         payload_key = "command" if direction == "TX" else "line"
         self.log_event(event_type, {"direction": direction, payload_key: logged_line}, logged_line)
@@ -147,32 +159,33 @@ class RunRecord:
         error_reason: str,
         response_summary: str,
     ) -> None:
-        self._sink(
-            "factory_test_items",
-            [
-                "timestamp",
-                "station_type",
-                "sn",
-                "item_name",
-                "command",
-                "result",
-                "elapsed_ms",
-                "error_reason",
-                "response_summary",
-            ],
-        ).writerow(
-            {
-                "timestamp": _iso(),
-                "station_type": station_type,
-                "sn": self.sn,
-                "item_name": item_name,
-                "command": redact_sensitive_text(command),
-                "result": result,
-                "elapsed_ms": elapsed_ms,
-                "error_reason": error_reason,
-                "response_summary": response_summary,
-            }
-        )
+        if self.write_extra_files:
+            self._sink(
+                "factory_test_items",
+                [
+                    "timestamp",
+                    "station_type",
+                    "sn",
+                    "item_name",
+                    "command",
+                    "result",
+                    "elapsed_ms",
+                    "error_reason",
+                    "response_summary",
+                ],
+            ).writerow(
+                {
+                    "timestamp": _iso(),
+                    "station_type": station_type,
+                    "sn": self.sn,
+                    "item_name": item_name,
+                    "command": redact_sensitive_text(command),
+                    "result": result,
+                    "elapsed_ms": elapsed_ms,
+                    "error_reason": error_reason,
+                    "response_summary": response_summary,
+                }
+            )
         self.log_event(
             "step_end",
             {
@@ -191,29 +204,32 @@ class RunRecord:
         self.meta["finished_at"] = datetime.now().isoformat(timespec="seconds")
         self.meta["result"] = result
         self.meta["details"] = details
-        (self.run_dir / "metadata.json").write_text(
-            json.dumps(self.meta, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        self._sink(
-            "summary",
-            ["timestamp_iso", "station", "sn", "dut_alias", "result", "details"],
-        ).writerow(
-            {
-                "timestamp_iso": _iso(),
-                "station": self.station,
-                "sn": self.sn,
-                "dut_alias": self.dut_alias,
-                "result": result,
-                "details": details,
-            }
-        )
+        if self.write_extra_files:
+            (self.run_dir / "metadata.json").write_text(
+                json.dumps(self.meta, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            self._sink(
+                "summary",
+                ["timestamp_iso", "station", "sn", "dut_alias", "result", "details"],
+            ).writerow(
+                {
+                    "timestamp_iso": _iso(),
+                    "station": self.station,
+                    "sn": self.sn,
+                    "dut_alias": self.dut_alias,
+                    "result": result,
+                    "details": details,
+                }
+            )
         self.close()
 
     def close(self) -> None:
         for sink in self.sinks.values():
             sink.close()
-        self.raw_log.close()
+        if self.raw_log is not None:
+            self.raw_log.close()
+            self.raw_log = None
 
     def ingest_line(self, line: str) -> None:
         parsed = parse_line(line)
@@ -223,6 +239,8 @@ class RunRecord:
                 {"kind": parsed.kind, "category": parsed.category, "fields": parsed.fields},
                 parsed.line or line,
             )
+        if not self.write_extra_files:
+            return
         if parsed.kind == "hw_result":
             self._sink(
                 "items",
@@ -480,9 +498,16 @@ class NullRunRecord:
 
 
 class RunStorage:
-    def __init__(self, root: str | Path) -> None:
+    def __init__(self, root: str | Path, write_extra_files: bool = False) -> None:
         self.root = Path(root)
+        self.write_extra_files = write_extra_files
 
     def start_run(self, station: str, sn: str, dut_alias: str = "") -> RunRecord:
         run_dir = self.root / datetime.now().strftime("%Y-%m-%d") / f"{_stamp()}_{_safe_name(station)}_{_safe_name(sn)}"
-        return RunRecord(run_dir, station=station, sn=sn, dut_alias=dut_alias)
+        return RunRecord(
+            run_dir,
+            station=station,
+            sn=sn,
+            dut_alias=dut_alias,
+            write_extra_files=self.write_extra_files,
+        )

@@ -1,10 +1,21 @@
+param([string]$InstallRoot = "")
+$ErrorActionPreference = "Stop"
+$utf8 = New-Object System.Text.UTF8Encoding $false
+if (-not $InstallRoot) {
+  foreach ($r in @((Join-Path $env:LOCALAPPDATA "Programs\Axi Factory Workstation"), "E:\AXI", "G:\AXI")) {
+    if (Test-Path (Join-Path $r "Axi Factory Workstation.exe")) { $InstallRoot = $r; break }
+  }
+}
+if (-not $InstallRoot) { throw "Pass -InstallRoot to the folder containing Axi Factory Workstation.exe" }
+$cfg = Join-Path $InstallRoot "config.json"
+$content = @"
 {
-  "firmware_repo": "..\\..",
+  "firmware_repo": ".",
   "flash_script_path": "",
   "half_flash_before_test": false,
   "flash_backend": "nrfjprog",
-  "flash_image_path": "..\\..\\build_ondemand\\merged.hex",
-  "half_flash_image_path": "..\\..\\build_ondemand\\merged.hex",
+  "flash_image_path": "firmware\\axi_p1_factory_merged.hex",
+  "half_flash_image_path": "firmware\\axi_p1_factory_merged.hex",
   "flash_after_wait_s": 8.0,
   "flash_timeout_s": 180.0,
   "flash_verify": true,
@@ -19,13 +30,13 @@
   "ble_dongle_port": "COM8",
   "ble_dongle_sd_version": "auto",
   "nrf_connect_ble_path": "",
-  "ota_image_path": "..\\..\\build_ondemand\\axi-p1-embeded\\zephyr\\zephyr.signed.bin",
+  "ota_image_path": "dfu_application.zip",
   "ota_enabled": false,
   "ota_reboot_wait_s": 15.0,
   "records_root": "factory_records",
   "prefer_transport": "UART",
   "station_id": "DEV",
-  "sn_enabled": true,
+  "sn_enabled": false,
   "capture_output_mode": "compact",
   "record_output_mode": "unified",
   "factory_at_required": true,
@@ -46,3 +57,6 @@
     "ota_s": 300.0
   }
 }
+"@
+[System.IO.File]::WriteAllText($cfg, $content.Trim(), $utf8)
+Write-Host "Fixed: $cfg"
