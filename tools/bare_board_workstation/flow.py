@@ -8,7 +8,7 @@ from typing import Callable
 
 from .config import BareBoardConfig
 from .flash_runner import FlashOutcome, run_flash
-from .records import RecordStorage
+from .records import NullRecord, RecordStorage
 from .serial_runner import SerialOutcome, collect_serial_log
 
 
@@ -37,15 +37,24 @@ def run_bare_board_test(
     flash_runner: FlashRunner | None = None,
     serial_runner: SerialRunner | None = None,
     stop_event: threading.Event | None = None,
+    record_enabled: bool | None = None,
 ) -> FlowOutcome:
     started = time.monotonic()
     sn_value = sn.strip()
-    ok, reason = config.validate_sn(sn_value)
-    if not ok:
-        elapsed_ms = int((time.monotonic() - started) * 1000)
-        return FlowOutcome(False, "NG", reason, "", None, None, elapsed_ms)
+    write_record = config.sn_record_enabled if record_enabled is None else bool(record_enabled)
+    if write_record:
+        ok, reason = config.validate_sn(sn_value)
+        if not ok:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            return FlowOutcome(False, "NG", reason, "", None, None, elapsed_ms)
+    elif not sn_value:
+        sn_value = "NO_SN"
 
-    record = RecordStorage(config.records_root).start_run(config, sn_value)
+    record = (
+        RecordStorage(config.records_root).start_run(config, sn_value)
+        if write_record
+        else NullRecord()
+    )
     stop = stop_event or threading.Event()
     flash_impl = flash_runner or run_flash
     serial_impl = serial_runner or collect_serial_log
@@ -69,13 +78,21 @@ def run_bare_board_test(
             progress("Flash", "NG", flash.message)
             record.finish("NG", f"flash failed: {flash.message}")
             elapsed_ms = int((time.monotonic() - started) * 1000)
-            return FlowOutcome(False, "NG", f"flash failed: {flash.message}", str(record.path), flash, None, elapsed_ms)
+            record_path = str(record.path) if write_record else ""
+            return FlowOutcome(False, "NG", f"flash failed: {flash.message}", record_path, flash, None, elapsed_ms)
         progress("Flash", "PASS", flash.message)
 
         wait_s = max(0.0, float(config.flash_after_wait_s or 0.0))
         if wait_s and not stop.is_set():
             progress("Wait", "RUN", f"{wait_s:.1f}s")
             time.sleep(wait_s)
+            if stop.is_set():
+                progress("Wait", "CANCELLED", "cancelled during wait")
+                record.finish("CANCELLED", "cancelled during wait")
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                record_path = str(record.path) if write_record else ""
+                return FlowOutcome(False, "CANCELLED", "cancelled during wait", record_path, flash, None, elapsed_ms)
+            progress("Wait", "PASS", f"{wait_s:.1f}s")
 
         progress("Serial", "RUN", config.serial_port or "unconfigured")
         serial = serial_impl(config, emit, stop)
@@ -83,11 +100,13 @@ def run_bare_board_test(
         result = "PASS" if serial.ok else serial.result
         record.finish(result, serial.message)
         elapsed_ms = int((time.monotonic() - started) * 1000)
-        return FlowOutcome(serial.ok, result, serial.message, str(record.path), flash, serial, elapsed_ms)
+        record_path = str(record.path) if write_record else ""
+        return FlowOutcome(serial.ok, result, serial.message, record_path, flash, serial, elapsed_ms)
     except Exception as exc:
         record.finish("NG", str(exc))
         elapsed_ms = int((time.monotonic() - started) * 1000)
-        return FlowOutcome(False, "NG", str(exc), str(record.path), None, None, elapsed_ms)
+        record_path = str(record.path) if write_record else ""
+        return FlowOutcome(False, "NG", str(exc), record_path, None, None, elapsed_ms)
     finally:
         try:
             record.close()
@@ -118,7 +137,12 @@ def make_simulated_flash_runner(message: str = "simulated flash completed") -> F
 
 
 def make_simulated_serial_runner(lines: list[str] | None = None) -> SerialRunner:
-    sample_lines = lines or ["BOOT bare-board-test", "SN READY", "RESULT:PASS"]
+    sample_lines = lines or [
+        "BOOT bare-board-test",
+        "[DRVTEST][WAIT]",
+        "[DRVTEST][START]",
+        "[DRVTEST][FINAL] overall=PASS",
+    ]
 
     def _runner(
         config: BareBoardConfig,

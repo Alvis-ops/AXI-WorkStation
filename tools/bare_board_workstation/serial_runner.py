@@ -81,14 +81,149 @@ def _pop_buffered_line(rx: bytearray) -> str | None:
     return None
 
 
-def _open_serial(config: BareBoardConfig) -> SerialLike:
-    if not config.serial_port:
+def open_serial_port(port: str, baudrate: int) -> SerialLike:
+    if not port:
         raise RuntimeError("serial_port is empty")
     try:
         import serial
     except ImportError as exc:
         raise RuntimeError("pyserial is required: pip install pyserial") from exc
-    return serial.Serial(config.serial_port, baudrate=int(config.serial_baudrate), timeout=0.05)
+    return serial.Serial(port, baudrate=int(baudrate), timeout=0.05)
+
+
+def _open_serial(config: BareBoardConfig) -> SerialLike:
+    return open_serial_port(config.serial_port, int(config.serial_baudrate))
+
+
+class SerialMonitor:
+    """Keep a serial port open and forward incoming lines to a callback."""
+
+    def __init__(self) -> None:
+        self._port: SerialLike | None = None
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._rx = bytearray()
+        self.port_name = ""
+        self.baudrate = 0
+
+    def is_open(self) -> bool:
+        return self._port is not None
+
+    def open(self, port: str, baudrate: int, line_callback: SerialLogCallback | None = None) -> None:
+        if self.is_open():
+            raise RuntimeError("serial monitor already open")
+        self._stop.clear()
+        self._rx = bytearray()
+        self.port_name = port
+        self.baudrate = baudrate
+        self._port = open_serial_port(port, baudrate)
+        try:
+            reset = getattr(self._port, "reset_input_buffer")
+            reset()
+        except Exception:
+            pass
+        self._thread = threading.Thread(
+            target=self._reader_loop,
+            args=(line_callback,),
+            daemon=True,
+            name="bare-board-serial-monitor",
+        )
+        self._thread.start()
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+        if self._port is not None:
+            try:
+                self._port.close()
+            except Exception:
+                pass
+            self._port = None
+        self.port_name = ""
+        self.baudrate = 0
+
+    def _reader_loop(self, line_callback: SerialLogCallback | None) -> None:
+        port = self._port
+        if port is None:
+            return
+        while not self._stop.is_set():
+            line = _pop_buffered_line(self._rx)
+            if line is None:
+                try:
+                    chunk = port.read(256)
+                except Exception:
+                    break
+                if chunk:
+                    self._rx.extend(chunk)
+                    line = _pop_buffered_line(self._rx)
+                else:
+                    time.sleep(0.01)
+                    continue
+            if line is None:
+                continue
+            if line_callback is not None:
+                line_callback("SERIAL_RX", line)
+
+
+def _wait_for_start_prompt(
+    config: BareBoardConfig,
+    port: SerialLike,
+    rx: bytearray,
+    lines: list[str],
+    line_callback: SerialLogCallback | None,
+    stop: threading.Event,
+    started: float,
+) -> tuple[bool, str]:
+    patterns = [str(p).strip() for p in config.start_prompt_patterns if str(p).strip()]
+    if not patterns:
+        return True, ""
+
+    deadline = time.monotonic() + max(1.0, float(config.start_prompt_timeout_s or 30.0))
+    while time.monotonic() < deadline and not stop.is_set():
+        line = _pop_buffered_line(rx)
+        if line is None:
+            chunk = port.read(256)
+            if chunk:
+                rx.extend(chunk)
+                line = _pop_buffered_line(rx)
+            else:
+                time.sleep(0.01)
+                continue
+        if line is None:
+            continue
+
+        lines.append(line)
+        if line_callback is not None:
+            line_callback("SERIAL_RX", line)
+        if _contains_any(line, config.fail_patterns):
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            raise RuntimeError(f"fail pattern matched before start prompt: {line} ({elapsed_ms}ms)")
+        if _contains_any(line, patterns):
+            return True, line
+
+    if stop.is_set():
+        return False, "serial collection cancelled"
+    return False, f"start prompt timeout after {config.start_prompt_timeout_s:.1f}s"
+
+
+def _outcome_for_line(
+    config: BareBoardConfig,
+    line: str,
+    started: float,
+    lines: list[str],
+) -> SerialOutcome | None:
+    if _contains_any(line, config.fail_patterns):
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        return SerialOutcome(False, "NG", f"fail pattern matched: {line}", elapsed_ms, lines)
+    if _contains_any(line, config.pass_patterns):
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        return SerialOutcome(True, "PASS", f"pass pattern matched: {line}", elapsed_ms, lines)
+    if _contains_any(line, config.end_patterns):
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        return SerialOutcome(False, "NG", f"test ended without pass pattern: {line}", elapsed_ms, lines)
+    return None
 
 
 def collect_serial_log(
@@ -105,14 +240,29 @@ def collect_serial_log(
 
     try:
         port = (serial_factory or _open_serial)(config)
-        try:
-            reset = getattr(port, "reset_input_buffer")
-            reset()
-        except Exception:
-            pass
+        has_start_command = bool(str(config.test_start_command or "").strip())
+        if not config.start_prompt_patterns or not has_start_command:
+            try:
+                reset = getattr(port, "reset_input_buffer")
+                reset()
+            except Exception:
+                pass
         wait_s = max(0.0, float(config.serial_open_wait_s or 0.0))
         if wait_s:
             time.sleep(wait_s)
+
+        prompt_ok, prompt_message = _wait_for_start_prompt(
+            config, port, rx, lines, line_callback, stop, started
+        )
+        if not prompt_ok:
+            if stop.is_set():
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                return SerialOutcome(False, "CANCELLED", prompt_message, elapsed_ms, lines)
+            if config.require_start_prompt:
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                return SerialOutcome(False, "NG", prompt_message, elapsed_ms, lines)
+            if line_callback is not None and prompt_message:
+                line_callback("SERIAL", f"WARN: {prompt_message}; sending start command anyway")
 
         command = str(config.test_start_command or "").strip()
         if command:
@@ -120,6 +270,11 @@ def collect_serial_log(
             port.flush()
             if line_callback is not None:
                 line_callback("SERIAL_TX", command)
+
+        for line in lines:
+            outcome = _outcome_for_line(config, line, started, lines)
+            if outcome is not None:
+                return outcome
 
         deadline = time.monotonic() + max(1.0, float(config.serial_timeout_s or 60.0))
         while time.monotonic() < deadline and not stop.is_set():
@@ -138,15 +293,9 @@ def collect_serial_log(
             lines.append(line)
             if line_callback is not None:
                 line_callback("SERIAL_RX", line)
-            if _contains_any(line, config.fail_patterns):
-                elapsed_ms = int((time.monotonic() - started) * 1000)
-                return SerialOutcome(False, "NG", f"fail pattern matched: {line}", elapsed_ms, lines)
-            if _contains_any(line, config.pass_patterns):
-                elapsed_ms = int((time.monotonic() - started) * 1000)
-                return SerialOutcome(True, "PASS", f"pass pattern matched: {line}", elapsed_ms, lines)
-            if _contains_any(line, config.end_patterns):
-                elapsed_ms = int((time.monotonic() - started) * 1000)
-                return SerialOutcome(False, "NG", f"test ended without pass pattern: {line}", elapsed_ms, lines)
+            outcome = _outcome_for_line(config, line, started, lines)
+            if outcome is not None:
+                return outcome
 
         elapsed_ms = int((time.monotonic() - started) * 1000)
         if stop.is_set():

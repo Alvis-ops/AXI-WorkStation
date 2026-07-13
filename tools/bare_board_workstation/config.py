@@ -48,21 +48,26 @@ class BareBoardConfig:
     flash_image_path: str = str(APP_BASE_DIR / "bare_board_test.hex")
     flash_script_path: str = ""
     nrfjprog_path: str = "nrfjprog"
-    nrfjprog_family: str = "NRF54L15_XXAA"
+    jlink_dll_path: str = ""
+    nrfjprog_family: str = ""
     jlink_probe_id: str = ""
-    flash_verify: bool = True
+    flash_verify: bool = False
     flash_timeout_s: float = 180.0
     flash_after_wait_s: float = 2.0
     serial_port: str = ""
     serial_baudrate: int = 460800
     serial_timeout_s: float = 60.0
-    serial_open_wait_s: float = 0.5
+    serial_open_wait_s: float = 0.0
+    start_prompt_patterns: list[str] = field(default_factory=list)
+    start_prompt_timeout_s: float = 0.0
+    require_start_prompt: bool = False
     test_start_command: str = ""
     pass_patterns: list[str] = field(default_factory=lambda: ["PASS", "TEST PASS", "RESULT:PASS"])
     fail_patterns: list[str] = field(default_factory=lambda: ["FAIL", "NG", "ERROR", "RESULT:FAIL"])
     end_patterns: list[str] = field(default_factory=lambda: ["TEST DONE", "END", "RESULT:"])
     records_root: str = field(default_factory=_default_records_root)
     station_id: str = "BARE"
+    sn_record_enabled: bool = True
     sn_rule: SNRule = field(default_factory=SNRule)
 
     @classmethod
@@ -115,6 +120,7 @@ def _resolve_config_paths(config: BareBoardConfig, base_dir: Path) -> BareBoardC
     config.flash_image_path = _resolve_path_field(config.flash_image_path, base_dir)
     config.flash_script_path = _resolve_path_field(config.flash_script_path, base_dir)
     config.nrfjprog_path = _resolve_tool_or_path_field(config.nrfjprog_path, base_dir)
+    config.jlink_dll_path = _resolve_path_field(config.jlink_dll_path, base_dir)
     config.records_root = _resolve_path_field(config.records_root, base_dir)
     return config
 

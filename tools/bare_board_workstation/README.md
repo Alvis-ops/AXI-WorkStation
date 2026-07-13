@@ -33,6 +33,7 @@ Copy-Item tools\bare_board_workstation\config.json.example tools\bare_board_work
 关键字段：
 
 - `flash_image_path`：裸板测试固件镜像，默认用于 `nrfjprog --program`。
+- `jlink_dll_path`：固定传给 `nrfjprog --jdll` 的 JLinkARM DLL；离线安装包会自动写入兼容版本。
 - `nrfjprog_family`：传给 `nrfjprog --family`。
 - `jlink_probe_id`：多 Probe 环境下的 J-Link 序列号。
 - `serial_port` / `serial_baudrate`：测试固件日志串口。
@@ -42,16 +43,18 @@ Copy-Item tools\bare_board_workstation\config.json.example tools\bare_board_work
 
 ## 运行
 
-GUI：
+GUI（ttkbootstrap 风格，布局参考 `factory_workstation`）：
 
 ```powershell
+pip install -r tools\requirements-workstation.txt
+Copy-Item tools\bare_board_workstation\config.json.example tools\bare_board_workstation\config.json
 python tools\bare_board_workstation\app.py
 ```
 
 CLI：
 
 ```powershell
-python tools\bare_board_workstation\cli.py --sn SN001 --port COM18 --flash-image path\to\bare_board_test.hex
+python tools\bare_board_workstation\cli.py --config tools\bare_board_workstation\config.json.example --sn SN001 --port COM18 --jlink-probe-id 69730371
 ```
 
 无硬件模拟：

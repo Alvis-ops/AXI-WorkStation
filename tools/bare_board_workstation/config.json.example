@@ -1,37 +1,36 @@
 {
-  "firmware_repo": "../..",
-  "flash_backend": "nrfjprog",
-  "flash_image_path": "../../bare_board_test.hex",
-  "flash_script_path": "",
+  "firmware_repo": "../../../POC3",
+  "flash_backend": "script",
+  "flash_image_path": "../../../POC3/build_factory/merged.hex",
+  "flash_script_path": "../../../POC3/flash_factory_test.ps1",
   "nrfjprog_path": "nrfjprog",
-  "nrfjprog_family": "NRF54L15_XXAA",
+  "jlink_dll_path": "",
+  "nrfjprog_family": "",
   "jlink_probe_id": "",
-  "flash_verify": true,
+  "flash_verify": false,
   "flash_timeout_s": 180.0,
   "flash_after_wait_s": 2.0,
   "serial_port": "",
-  "serial_baudrate": 460800,
-  "serial_timeout_s": 60.0,
-  "serial_open_wait_s": 0.5,
-  "test_start_command": "",
+  "serial_baudrate": 115200,
+  "serial_timeout_s": 90.0,
+  "serial_open_wait_s": 0.0,
+  "start_prompt_patterns": [],
+  "start_prompt_timeout_s": 0.0,
+  "require_start_prompt": false,
+  "test_start_command": "AT+DRVTEST",
   "pass_patterns": [
-    "PASS",
-    "TEST PASS",
-    "RESULT:PASS"
+    "re:\\[DRVTEST\\]\\[FINAL\\].*overall=PASS"
   ],
   "fail_patterns": [
-    "FAIL",
-    "NG",
-    "ERROR",
-    "RESULT:FAIL"
+    "re:\\[DRVTEST\\]\\[FINAL\\].*overall=FAIL",
+    "re:\\[DRVTEST\\]\\[ABORT\\]"
   ],
   "end_patterns": [
-    "TEST DONE",
-    "END",
-    "RESULT:"
+    "re:\\[DRVTEST\\]\\[FINAL\\]"
   ],
   "records_root": "../../bare_board_records",
   "station_id": "BARE",
+  "sn_record_enabled": true,
   "sn_rule": {
     "min_len": 1,
     "max_len": 48,

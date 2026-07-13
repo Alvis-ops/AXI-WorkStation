@@ -4,7 +4,7 @@ import hashlib
 import os
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -13,6 +13,7 @@ from .config import BareBoardConfig
 
 FlashLogCallback = Callable[[str, str], None]
 JLINK_ERROR_256 = "JLinkARM.dll reported error -256"
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def _to_text(value: object) -> str:
@@ -64,6 +65,18 @@ class FlashOutcome:
         return self.command.jlink_probe_id if self.command is not None else ""
 
 
+@dataclass
+class JLinkDetectResult:
+    ok: bool
+    level: str
+    message: str
+    probe_ids: list[str] = field(default_factory=list)
+    nrfjprog_path: str = ""
+    nrfjprog_version: str = ""
+    exit_code: int | None = None
+    raw_output: str = ""
+
+
 def file_sha256(path: str | Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -83,6 +96,15 @@ def _require_file(path_text: str, label: str) -> Path:
     return path
 
 
+def _jlink_dll_args(config: BareBoardConfig, *, require_file: bool = True) -> list[str]:
+    dll_path = str(config.jlink_dll_path or "").strip()
+    if not dll_path:
+        return []
+    if require_file:
+        dll_path = str(_require_file(dll_path, "J-Link DLL"))
+    return ["--jdll", dll_path]
+
+
 def build_flash_command(config: BareBoardConfig) -> FlashCommand:
     backend = str(config.flash_backend or "nrfjprog").strip().lower()
     env = os.environ.copy()
@@ -93,7 +115,7 @@ def build_flash_command(config: BareBoardConfig) -> FlashCommand:
     if backend == "nrfjprog":
         image = _require_file(config.flash_image_path, "flash image")
         tool = str(config.nrfjprog_path or "nrfjprog").strip() or "nrfjprog"
-        argv = [tool, "--program", str(image), "--chiperase"]
+        argv = [tool, "--program", str(image), "--chiperase", *_jlink_dll_args(config)]
         family = str(config.nrfjprog_family or "").strip()
         if family:
             argv.extend(["--family", family])
@@ -147,10 +169,183 @@ def build_flash_command(config: BareBoardConfig) -> FlashCommand:
     raise ValueError(f"unsupported flash backend: {backend}")
 
 
+def _parse_probe_ids(output: str) -> list[str]:
+    probe_ids: list[str] = []
+    for raw in output.splitlines():
+        line = raw.strip()
+        if line.isdigit() and 6 <= len(line) <= 16:
+            probe_ids.append(line)
+    return probe_ids
+
+
+def _run_nrfjprog_tool(tool: str, args: list[str], timeout_s: float = 15.0) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [tool, *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout_s,
+        creationflags=CREATE_NO_WINDOW,
+    )
+
+
+def detect_jlink_probes(config: BareBoardConfig) -> JLinkDetectResult:
+    backend = str(config.flash_backend or "nrfjprog").strip().lower()
+    if backend == "script":
+        return JLinkDetectResult(
+            ok=True,
+            level="WARN",
+            message="当前为 script 烧录方式，请由脚本自行选择 J-Link 探针",
+        )
+    if backend != "nrfjprog":
+        return JLinkDetectResult(False, "ERR", f"unsupported flash backend: {backend}")
+
+    tool = str(config.nrfjprog_path or "nrfjprog").strip() or "nrfjprog"
+    configured_probe = str(config.jlink_probe_id or "").strip()
+    try:
+        jlink_dll_args = _jlink_dll_args(config)
+    except (FileNotFoundError, ValueError) as exc:
+        return JLinkDetectResult(False, "ERR", str(exc), nrfjprog_path=tool)
+    try:
+        version_proc = _run_nrfjprog_tool(tool, ["--version", *jlink_dll_args])
+        ids_proc = _run_nrfjprog_tool(tool, ["--ids", *jlink_dll_args])
+    except FileNotFoundError:
+        return JLinkDetectResult(
+            False,
+            "ERR",
+            f"未找到 nrfjprog: {tool}。新电脑请先以管理员身份运行 install_offline_win10.cmd",
+            nrfjprog_path=tool,
+        )
+    except subprocess.TimeoutExpired:
+        return JLinkDetectResult(False, "ERR", "nrfjprog 检测超时", nrfjprog_path=tool)
+    except Exception as exc:
+        return JLinkDetectResult(False, "ERR", f"nrfjprog 检测失败: {exc}", nrfjprog_path=tool)
+
+    version_output = "\n".join(part for part in (version_proc.stdout, version_proc.stderr) if part).strip()
+    ids_output = "\n".join(part for part in (ids_proc.stdout, ids_proc.stderr) if part).strip()
+    raw_output = "\n".join(part for part in (version_output, ids_output) if part)
+    probe_ids = _parse_probe_ids(ids_output)
+    version_line = next(
+        (line.strip() for line in version_output.splitlines() if line.strip().lower().startswith("nrfjprog version:")),
+        version_output,
+    )
+
+    if version_proc.returncode != 0 or JLINK_ERROR_256 in raw_output:
+        dll_hint = str(config.jlink_dll_path or "自动选择的 J-Link DLL")
+        return JLinkDetectResult(
+            False,
+            "ERR",
+            f"J-Link DLL 与 nrfjprog 不兼容: {dll_hint}。请重新运行 r13 离线安装包",
+            probe_ids=probe_ids,
+            nrfjprog_path=tool,
+            nrfjprog_version=version_line,
+            exit_code=version_proc.returncode,
+            raw_output=raw_output,
+        )
+
+    if configured_probe:
+        if probe_ids and configured_probe not in probe_ids:
+            return JLinkDetectResult(
+                False,
+                "ERR",
+                f"配置的 J-Link SN {configured_probe} 未找到；当前检测到: {', '.join(probe_ids)}",
+                probe_ids=probe_ids,
+                nrfjprog_path=tool,
+                nrfjprog_version=version_line,
+                exit_code=ids_proc.returncode,
+                raw_output=raw_output,
+            )
+        if not probe_ids:
+            message = (
+                "未检测到 J-Link 探针。请连接 J-Link USB，确认设备管理器中有 SEGGER，"
+                "必要时以管理员身份重新运行 install_offline_win10.cmd 后重新插拔探针"
+            )
+            if ids_proc.returncode != 0 and ids_output:
+                message = f"{message}（exit={ids_proc.returncode}）"
+            return JLinkDetectResult(
+                False,
+                "ERR",
+                message,
+                probe_ids=probe_ids,
+                nrfjprog_path=tool,
+                nrfjprog_version=version_line,
+                exit_code=ids_proc.returncode,
+                raw_output=raw_output,
+            )
+        return JLinkDetectResult(
+            True,
+            "OK",
+            f"已找到配置的 J-Link SN {configured_probe}",
+            probe_ids=probe_ids,
+            nrfjprog_path=tool,
+            nrfjprog_version=version_line,
+            exit_code=ids_proc.returncode,
+            raw_output=raw_output,
+        )
+
+    if not probe_ids:
+        message = (
+            "未检测到 J-Link 探针。请连接 J-Link USB，确认设备管理器中有 SEGGER，"
+            "必要时以管理员身份重新运行 install_offline_win10.cmd 后重新插拔探针"
+        )
+        if ids_proc.returncode != 0 and ids_output:
+            message = f"{message}（exit={ids_proc.returncode}）"
+        return JLinkDetectResult(
+            False,
+            "ERR",
+            message,
+            probe_ids=probe_ids,
+            nrfjprog_path=tool,
+            nrfjprog_version=version_line,
+            exit_code=ids_proc.returncode,
+            raw_output=raw_output,
+        )
+    if len(probe_ids) > 1:
+        return JLinkDetectResult(
+            True,
+            "WARN",
+            f"检测到多个 J-Link 探针: {', '.join(probe_ids)}；请在 J-Link ID 中指定 SN",
+            probe_ids=probe_ids,
+            nrfjprog_path=tool,
+            nrfjprog_version=version_line,
+            exit_code=ids_proc.returncode,
+            raw_output=raw_output,
+        )
+    return JLinkDetectResult(
+        True,
+        "OK",
+        f"检测到 J-Link SN {probe_ids[0]}",
+        probe_ids=probe_ids,
+        nrfjprog_path=tool,
+        nrfjprog_version=version_line,
+        exit_code=ids_proc.returncode,
+        raw_output=raw_output,
+    )
+
+
+def precheck_nrfjprog_probe(config: BareBoardConfig) -> tuple[bool, str, list[str]]:
+    result = detect_jlink_probes(config)
+    if result.ok:
+        if result.level == "WARN" and len(result.probe_ids) > 1:
+            return False, result.message, result.probe_ids
+        return True, result.message if result.level == "WARN" else "", result.probe_ids
+    return False, result.message, result.probe_ids
+
+
 def run_flash(config: BareBoardConfig, line_callback: FlashLogCallback | None = None) -> FlashOutcome:
     started = time.monotonic()
     command: FlashCommand | None = None
     try:
+        ok, message, probe_ids = precheck_nrfjprog_probe(config)
+        if not ok:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            if line_callback is not None:
+                line_callback("FLASH", f"ERROR: {message}")
+            return FlashOutcome(False, "NG", message, elapsed_ms, 41, command)
+        if line_callback is not None and probe_ids:
+            line_callback("FLASH", f"J-Link probe detected: {', '.join(probe_ids)}")
+
         command = build_flash_command(config)
         if line_callback is not None:
             line_callback("FLASH", command.display)
@@ -163,6 +358,7 @@ def run_flash(config: BareBoardConfig, line_callback: FlashLogCallback | None = 
             text=True,
             encoding="utf-8",
             errors="replace",
+            creationflags=CREATE_NO_WINDOW,
         )
         timeout_s = max(1.0, float(config.flash_timeout_s or 180.0))
         try:
