@@ -13,7 +13,7 @@ if __package__ in (None, ""):
     from factory_workstation.at_client import ATClient
     from factory_workstation.at_parser import is_capture_frame_line
     from factory_workstation.config import CONFIG_PATH, WorkstationConfig, get_factory_token, load_config
-    from factory_workstation.flash_flow import precheck_flash_request, probe_at_client, record_flash_step
+    from factory_workstation.flash_flow import probe_at_client, record_flash_step
     from factory_workstation.flash_runner import FlashOutcome, run_flash
     from factory_workstation.flows import FlowOutcome, run_full_machine, run_half_machine
     from factory_workstation.storage import NullRunRecord, RunStorage
@@ -23,7 +23,7 @@ else:
     from .at_client import ATClient
     from .at_parser import is_capture_frame_line
     from .config import CONFIG_PATH, WorkstationConfig, get_factory_token, load_config
-    from .flash_flow import precheck_flash_request, probe_at_client, record_flash_step
+    from .flash_flow import probe_at_client, record_flash_step
     from .flash_runner import FlashOutcome, run_flash
     from .flows import FlowOutcome, run_full_machine, run_half_machine
     from .storage import NullRunRecord, RunStorage
@@ -239,14 +239,8 @@ def run(
 
         if flash_before_half:
             flash_config = _half_flash_config(config)
-            if flash_runner is None:
-                precheck = precheck_flash_request(flash_config, sn_enabled=sn_enabled, dry_run=not sn_enabled)
-                if precheck.level == "WARN":
-                    print(f"[WARN] flash precheck: {precheck.message}", flush=True)
-                if not precheck.ok:
-                    record.finish("NG", f"flash precheck failed: {precheck.message}")
-                    print(f"[RESULT] NG flash precheck failed: {precheck.message}", flush=True)
-                    return 2
+            # GUI/CLI no longer auto-run the slow J-Link precheck before flash.
+            # Operators can use the GUI "烧录检测" button when they want it.
             outcome = _run_flash_step(flash_config, record, _progress, flash_runner_impl)
             if not outcome.ok:
                 record.finish("NG", f"flash failed: {outcome.message}")

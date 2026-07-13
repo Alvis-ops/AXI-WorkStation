@@ -14,7 +14,7 @@ from typing import Any
 PACKAGE_DIR = Path(__file__).resolve().parent
 TOOLS_DIR = PACKAGE_DIR.parent
 APP_BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else TOOLS_DIR.parent
-FIRMWARE_REPO = TOOLS_DIR.parent if not getattr(sys, "frozen", False) else APP_BASE_DIR
+FIRMWARE_REPO = TOOLS_DIR.parent.parent / "axi-p1-embeded" if not getattr(sys, "frozen", False) else APP_BASE_DIR
 CONFIG_PATH = (APP_BASE_DIR if getattr(sys, "frozen", False) else PACKAGE_DIR) / "config.json"
 ENV_PATH = (APP_BASE_DIR if getattr(sys, "frozen", False) else PACKAGE_DIR) / ".env"
 TOUCH_CAPTURE_MIN_TIMEOUT_S = 45.0
@@ -297,6 +297,37 @@ def get_recover_token(runtime_token: str = "") -> str:
         return dotenv_token
     load_dotenv()
     return os.environ.get("AXI_FACTORY_RECOVER_TOKEN", "").strip() or os.environ.get("POC3A_RECOVER_TOKEN", "").strip()
+
+
+def has_engineer_password(config: WorkstationConfig | None = None) -> bool:
+    """True when any engineer-password source is configured on this station."""
+    load_dotenv()
+    dotenv = _dotenv_values()
+    if (dotenv.get("AXI_FACTORY_ENGINEER_PASSWORD", "") or os.environ.get("AXI_FACTORY_ENGINEER_PASSWORD", "")).strip():
+        return True
+    expected_hash = (
+        dotenv.get("AXI_FACTORY_ENGINEER_PASSWORD_SHA256", "").strip()
+        or os.environ.get("AXI_FACTORY_ENGINEER_PASSWORD_SHA256", "").strip()
+    )
+    if expected_hash:
+        return True
+    if config is not None and config.engineer_password_sha256.strip():
+        return True
+    return False
+
+
+def save_engineer_password(password: str) -> None:
+    """Persist engineer password as SHA256 only; clear any plaintext key."""
+    value = password.strip()
+    if not value:
+        raise ValueError("engineer password is empty")
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    save_dotenv_values(
+        {
+            "AXI_FACTORY_ENGINEER_PASSWORD_SHA256": digest,
+            "AXI_FACTORY_ENGINEER_PASSWORD": "",
+        }
+    )
 
 
 def verify_engineer_password(password: str, config: WorkstationConfig) -> bool:

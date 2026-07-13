@@ -57,7 +57,7 @@ Defaults:
 - Default OTA image: `build_ondemand/axi-p1-embeded/zephyr/zephyr.signed.bin`. The older top-level `build_ondemand/dfu_application.zip` may be stale after incremental builds.
 - Runtime tokens: environment or `tools/factory_workstation/.env`, not `config.json`.
 - Chip flash: optional and disabled by default. Engineering mode can enable `half_flash_before_test`, select `nrfjprog` or `script`, choose independent flash image `flash_image_path`, choose half-machine pre-test flash image `half_flash_image_path`, set `jlink_probe_id`, and set `flash_after_wait_s`. When enabled, half-machine test first flashes `half_flash_image_path`, then reconnects and runs the original half-machine AT flow.
-- `nrfjprog` flashing uses `flash_timeout_s` (default 180 seconds). In SN/record mode, multiple connected J-Link probes require `jlink_probe_id`; dry-run mode warns but can continue.
+- `nrfjprog` flashing uses `flash_timeout_s` (default 180 seconds). Multi-probe stations should set `jlink_probe_id`. Use the GUI `烧录检测` button for an optional J-Link/`nrfjprog --ids` check; flash start no longer runs that probe automatically.
 - Capture output: `capture_output_mode` defaults to `compact`. The workstation sends `...,COMPACT` capture commands for MOMO empty capture, LRA vibcapture and PPG reflect capture when the firmware supports it. Set `capture_output_mode` to `legacy` for older firmware.
 - Record output: `record_output_mode` defaults to `unified`. In the GUI settings page, set `记录格式` to `集成记录（单个 unified_log.csv）` or `分散记录（兼容多文件）`. CLI can override it with `--record-output-mode unified|split`.
 
@@ -81,14 +81,22 @@ With the default `nrf_dongle` backend, the workstation scans, connects, enables 
 
 ## OP mode vs engineering mode
 
-- **OP mode**: half-machine, full-machine, OTA, BLE scan/selection, and connection controls. Manual AT engineering debug is disabled. Factory token is read from `.env` or environment variables; the operator does not need to see or type it.
-- **Engineering mode**: enables settings, independent chip flashing, factory token setup, and manual AT engineering debug. It requires `AXI_FACTORY_ENGINEER_PASSWORD` or `AXI_FACTORY_ENGINEER_PASSWORD_SHA256`. The token setup dialog stores the token in `.env`, then hides it from the UI; after logout, OP mode can still run automated tests with that hidden token. Half-machine flash-before-test can be configured by an engineer and then executed by the operator as part of the automated half flow.
+- **OP mode**: half-machine, full-machine, OTA, BLE scan/selection, and connection controls. Manual AT engineering debug is disabled. Factory token is read from `.env` or environment variables; the operator does not need to see or type it. The AT log panel hides raw TX/RX lines in OP mode; step status, INFO/OK/WARN/ERR, and file records remain complete.
+- **First launch**: if this station has no engineer password yet (`.env` / environment / `config.engineer_password_sha256`), the GUI shows a blocking setup dialog. An engineer password is required before the main window can be used; factory token may be left empty and set later after engineering login.
+- **Engineering mode**: enables settings, independent chip flashing, factory token setup, and manual AT engineering debug. It requires `AXI_FACTORY_ENGINEER_PASSWORD` or `AXI_FACTORY_ENGINEER_PASSWORD_SHA256`. First-setup and later password saves store SHA256 only. The token setup dialog stores the token in `.env`, then hides it from the UI; after logout, OP mode can still run automated tests with that hidden token. Half-machine flash-before-test can be configured by an engineer and then executed by the operator as part of the automated half flow. Engineering mode also shows detailed AT TX/RX in the log panel.
+
+## UI / record performance notes
+
+- Record writes use batched flush for CSV sinks and `raw_at.log` (when split mode is enabled). Step end and run close force a flush so the last batch is on disk.
+- Capture frame RX lines are stored as semantic events (`touch_frame` / `vib_frame` / `ppg_frame`) in `unified_log.csv` and no longer also write a redundant `at_rx` row. Non-frame RX still writes `at_rx`. `ingest_line` still runs for every RX line, so split frame CSVs are unchanged.
+- GUI event loop drains a bounded snapshot each tick, processes control events (`step` / `busy` / `flow_done` / connection / prompts) first, then batch-inserts log lines once. PASS/NG status colors use a small overlay on the status cell only; other step text stays black. Window resize layout is debounced until the drag settles.
 
 ## Chip flashing
 
 - Default backend: `nrfjprog`.
 - Default images in the offline installer: both independent flashing and half-machine pre-test flashing point to `firmware\axi_p1_factory_merged.hex`.
 - Independent flashing is available on the `芯片烧录` tab after engineering login and uses `flash_image_path`.
+- Starting a flash only does a fast local path check (hex/script exists). The slow J-Link/`nrfjprog --ids` probe is **manual**: use the `烧录检测` button on the flash tab when needed.
 - Half-machine flash-before-test is configured in `设置` and uses `half_flash_image_path`. When enabled, the workstation closes any current UART/BLE connection, runs J-Link flashing, waits `flash_after_wait_s`, reconnects with the selected transport, probes `AT` and `AT+VER?`, then starts the existing half-machine flow.
 - Flash failures stop the half-machine flow before `AT+FACTORY=UNLOCK`.
 - In SN/record mode, `unified_log.csv` contains `flash_start`, `flash_log`, `flash_end`, and a `Firmware flash` step. In dry-run mode, no formal CSV record is created.

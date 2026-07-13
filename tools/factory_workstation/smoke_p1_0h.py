@@ -6,6 +6,7 @@ import csv
 import io
 import json
 import os
+import queue
 import subprocess
 import sys
 import tempfile
@@ -23,7 +24,15 @@ if __package__ in (None, ""):
     from factory_workstation import flows
     from factory_workstation.at_client import ATClient, CommandResult
     from factory_workstation.at_parser import is_capture_frame_line, parse_line
-    from factory_workstation.config import WorkstationConfig, get_factory_token, redact_sensitive_text, save_factory_token, verify_engineer_password
+    from factory_workstation.config import (
+        WorkstationConfig,
+        get_factory_token,
+        has_engineer_password,
+        redact_sensitive_text,
+        save_engineer_password,
+        save_factory_token,
+        verify_engineer_password,
+    )
     from factory_workstation.flash_runner import FlashCommand, FlashOutcome
     from factory_workstation import ota_runner
     from factory_workstation import transport_ble
@@ -35,7 +44,15 @@ else:
     from . import flows
     from .at_client import ATClient, CommandResult
     from .at_parser import is_capture_frame_line, parse_line
-    from .config import WorkstationConfig, get_factory_token, redact_sensitive_text, save_factory_token, verify_engineer_password
+    from .config import (
+        WorkstationConfig,
+        get_factory_token,
+        has_engineer_password,
+        redact_sensitive_text,
+        save_engineer_password,
+        save_factory_token,
+        verify_engineer_password,
+    )
     from .flash_runner import FlashCommand, FlashOutcome
     from . import ota_runner
     from . import transport_ble
@@ -135,7 +152,7 @@ class ScriptedTransport:
 class FakeBleTransport(ScriptedTransport):
     default_responses = {
         "AT": ["OK"],
-        "AT+VER?": ["+VER:version=2.1.0,build=smoke", "OK"],
+        "AT+VER?": ["+VER:version=0.0.1,build=smoke", "OK"],
         "AT+SN?": ["+SN:value=SN001,source=lfs", "OK"],
         "AT+CAP?": ["+CAP:factory_prod=1", "OK"],
         "AT+OTABUSY?": ["+OTABUSY:locked=0", "OK"],
@@ -159,7 +176,7 @@ class TimeoutRecordingClient:
         self.calls.append((command, timeout_s))
         responses = {
             "AT+CAP?": ["+CAP:factory_prod=1", "OK"],
-            "AT+VER?": ["+VER:version=2.1.0,build=smoke", "OK"],
+            "AT+VER?": ["+VER:version=0.0.1,build=smoke", "OK"],
             "AT+OTABUSY?": ["+OTABUSY:locked=0", "OK"],
             TOUCH_CAPTURE_CMD: ["+HW:TOUCH:CAPTURE:samples=60", "OK"],
             VIB_CAPTURE_CMD: ["+HW:IMU:VIBSUMMARY:samples=150,status=PASS", "OK"],
@@ -284,11 +301,51 @@ def test_engineer_password_and_saved_token() -> None:
             os.environ["AXI_FACTORY_ENGINEER_TOKEN"] = old_token
 
 
+def test_save_engineer_password_sha256_only() -> None:
+    old_plain = os.environ.get("AXI_FACTORY_ENGINEER_PASSWORD")
+    old_hash = os.environ.get("AXI_FACTORY_ENGINEER_PASSWORD_SHA256")
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            from factory_workstation import config as config_module
+
+            original_env_path = config_module.ENV_PATH
+            config_module.ENV_PATH = Path(tmp) / ".env"
+            try:
+                os.environ.pop("AXI_FACTORY_ENGINEER_PASSWORD", None)
+                os.environ.pop("AXI_FACTORY_ENGINEER_PASSWORD_SHA256", None)
+                _assert(not has_engineer_password(WorkstationConfig()), "empty station should report no engineer password")
+                save_engineer_password("first-setup-pass")
+                env_text = config_module.ENV_PATH.read_text(encoding="utf-8")
+                _assert("AXI_FACTORY_ENGINEER_PASSWORD_SHA256=" in env_text, "sha256 password was not saved")
+                _assert("first-setup-pass" not in env_text, "plaintext password leaked into .env")
+                plain_line = [
+                    line
+                    for line in env_text.splitlines()
+                    if line.startswith("AXI_FACTORY_ENGINEER_PASSWORD=")
+                    and not line.startswith("AXI_FACTORY_ENGINEER_PASSWORD_SHA256=")
+                ]
+                _assert(not plain_line or plain_line[0].endswith('=""') or plain_line[0].endswith("="), "plaintext password key should be empty")
+                _assert(has_engineer_password(WorkstationConfig()), "saved password should be detected")
+                _assert(verify_engineer_password("first-setup-pass", WorkstationConfig()), "saved sha256 password failed verify")
+                _assert(not verify_engineer_password("wrong", WorkstationConfig()), "wrong password accepted after sha256 save")
+            finally:
+                config_module.ENV_PATH = original_env_path
+    finally:
+        if old_plain is None:
+            os.environ.pop("AXI_FACTORY_ENGINEER_PASSWORD", None)
+        else:
+            os.environ["AXI_FACTORY_ENGINEER_PASSWORD"] = old_plain
+        if old_hash is None:
+            os.environ.pop("AXI_FACTORY_ENGINEER_PASSWORD_SHA256", None)
+        else:
+            os.environ["AXI_FACTORY_ENGINEER_PASSWORD_SHA256"] = old_hash
+
+
 def _half_success_responses() -> dict[str, list[str]]:
     return {
         "AT+CAP?": ["+CAP:factory_prod=1", "OK"],
         "AT": ["OK"],
-        "AT+VER?": ["+VER:version=2.1.0,build=smoke", "OK"],
+        "AT+VER?": ["+VER:version=0.0.1,build=smoke", "OK"],
         "AT+FACTORY=UNLOCK,TOKEN": ["OK"],
         "AT+SN=SN001": ["OK"],
         "AT+SN?": ["+SN:value=SN001,source=lfs", "OK"],
@@ -310,7 +367,7 @@ def _full_success_responses() -> dict[str, list[str]]:
     return {
         "AT+CAP?": ["+CAP:factory_prod=1", "OK"],
         "AT": ["OK"],
-        "AT+VER?": ["+VER:version=2.1.0,build=smoke", "OK"],
+        "AT+VER?": ["+VER:version=0.0.1,build=smoke", "OK"],
         "AT+SN?": ["+SN:value=SN001,source=lfs", "OK"],
         "AT+OTABUSY?": ["+OTABUSY:locked=0", "OK"],
         "AT+FACTORY=UNLOCK,TOKEN": ["OK"],
@@ -328,7 +385,7 @@ def test_unlock_failure_cleanup() -> None:
     responses = {
         "AT+CAP?": ["+CAP:factory_prod=1", "OK"],
         "AT": ["OK"],
-        "AT+VER?": ["+VER:version=2.1.0,build=smoke", "OK"],
+        "AT+VER?": ["+VER:version=0.0.1,build=smoke", "OK"],
         "AT+FACTORY=UNLOCK,TOKEN": ["OK"],
         "AT+SN=SN001": ["OK"],
         "AT+SN?": ["+SN:value=SN001,source=lfs", "OK"],
@@ -562,18 +619,34 @@ def test_compact_parser_and_unified_log() -> None:
         record.log_at("RX", touch.line)
         record.log_at("RX", vib.line)
         record.log_at("RX", ppg.line)
-        record.log_at("RX", "+HW:IMU:VIBSUMMARY:samples=150,duration_ms=3000,interval_ms=20,elapsed_ms=3020,overruns=0,max_late_ms=0,status=PASS")
+        summary_line = "+HW:IMU:VIBSUMMARY:samples=150,duration_ms=3000,interval_ms=20,elapsed_ms=3020,overruns=0,max_late_ms=0,status=PASS"
+        record.log_at("RX", summary_line)
         record.log_item("full", "Touch capture", TOUCH_CAPTURE_CMD, "PASS", 1234, "", "OK")
         record.finish("PASS", "completed")
 
         unified_path = run_dir / "unified_log.csv"
         rows = list(csv.DictReader(unified_path.open("r", encoding="utf-8")))
         event_types = {row["event_type"] for row in rows}
-        _assert({"flow_start", "step_start", "at_tx", "at_rx", "touch_frame", "vib_frame", "ppg_frame", "vib_summary", "step_end", "flow_end"} <= event_types, "unified_log missing events")
+        _assert(
+            {"flow_start", "step_start", "at_tx", "touch_frame", "vib_frame", "ppg_frame", "vib_summary", "step_end", "flow_end"}
+            <= event_types,
+            "unified_log missing events",
+        )
+        # B1a line-level: frame raw_line must not also appear as at_rx.
+        frame_lines = {touch.line, vib.line, ppg.line}
+        for row in rows:
+            if row["event_type"] == "at_rx" and row["raw_line"] in frame_lines:
+                raise AssertionError(f"frame line still recorded as at_rx: {row['raw_line']}")
+        _assert({"touch_frame", "vib_frame", "ppg_frame"} <= event_types, "semantic frame events missing")
+        _assert(any(row["event_type"] == "at_rx" and row["raw_line"] == summary_line for row in rows), "non-frame RX missing at_rx")
         unified_text = unified_path.read_text(encoding="utf-8")
         _assert("SECRET_TOKEN" not in unified_text, "unified_log leaked token")
         _assert("AT+FACTORY=UNLOCK,***" in unified_text, "unified_log did not retain redacted token")
         _assert({path.name for path in run_dir.iterdir() if path.is_file()} == {"unified_log.csv"}, "capture run wrote extra files")
+        # B1: batch flush should not flush on every writerow for small runs, but close must persist.
+        unified_sink = record.sinks.get("unified_log")
+        _assert(unified_sink is not None, "unified_log sink missing")
+        _assert(unified_sink.flush_count >= 1, "unified_log was never flushed")
 
 
 def test_split_record_output_writes_compatibility_files() -> None:
@@ -615,6 +688,26 @@ def test_split_record_output_writes_compatibility_files() -> None:
             text = (run_dir / file_name).read_text(encoding="utf-8")
             _assert(secret not in text, f"{file_name} leaked token")
             _assert("AT+FACTORY=UNLOCK,***" in text, f"{file_name} did not keep redacted command")
+
+        # B1b content-level: row counts and last-batch persistence after close.
+        def _csv_rows(name: str) -> list[dict[str, str]]:
+            return list(csv.DictReader((run_dir / name).open("r", encoding="utf-8")))
+
+        momo_raw = _csv_rows("momo_raw.csv")
+        momo_filt = _csv_rows("momo_filt.csv")
+        lra_frames = _csv_rows("lra_frames.csv")
+        ppg_frames = _csv_rows("ppg_frames.csv")
+        capture_summary = _csv_rows("capture_summary.csv")
+        _assert(len(momo_raw) == 1 and momo_raw[0]["raw0"] == "100", "momo_raw content incomplete")
+        _assert(len(momo_filt) == 1 and momo_filt[0]["baseline3"] == "83", "momo_filt content incomplete")
+        _assert(len(lra_frames) == 1 and lra_frames[0]["gx"] == "1", "lra_frames content incomplete")
+        _assert(len(ppg_frames) == 1 and ppg_frames[0]["green0"] == "123", "ppg_frames content incomplete")
+        _assert(len(capture_summary) >= 1 and capture_summary[-1]["kind"] == "vib_summary", "capture_summary missing vib_summary")
+        raw_at = (run_dir / "raw_at.log").read_text(encoding="utf-8")
+        _assert(touch_line in raw_at and summary_line in raw_at, "raw_at.log missing last-batch lines after close")
+        for sink_name in ("unified_log", "lra_frames", "ppg_frames", "momo_raw"):
+            sink = record.sinks.get(sink_name)
+            _assert(sink is not None and sink.flush_count >= 1, f"{sink_name} not flushed on close")
 
 
 def _fake_flash_outcome(ok: bool = True) -> FlashOutcome:
@@ -660,8 +753,15 @@ def _run_cli_with_responses(
             line_callback("FLASH", "mock flash line")
         return _fake_flash_outcome(fake_flash_ok is not False)
 
+    cli_args = list(args)
+    # Local config.json may enable half_flash_before_test. Smoke cases that are
+    # not explicitly testing flash must not inherit that and call real nrfjprog.
+    flash_flags = {"--flash-before-test", "--no-flash-before-test"}
+    if fake_flash_ok is None and not flash_flags.intersection(cli_args):
+        cli_args.append("--no-flash-before-test")
+
     exit_code = cli.run(
-        args,
+        cli_args,
         transport_factory=factory,
         flash_runner=fake_flash if fake_flash_ok is not None else None,
     )
@@ -1226,10 +1326,69 @@ def test_dongle_kwargs_property_and_close() -> None:
     _assert(transport._dongle_proc is None, "dongle close left a process handle")
 
 
+def test_ui_log_batch_op_filter_and_poll_split() -> None:
+    from factory_workstation import ui_main as ui_mod
+
+    app = object.__new__(ui_mod.WorkstationApp)
+    app.engineering_mode = False
+    app._resize_active = False
+    app._log_autoscroll_deferred = False
+    app._log_line_count = 0
+    app._ui_metrics = {"insert_calls": 0, "see_calls": 0, "ticks": 0, "control_events": 0, "log_events": 0}
+    app.events = queue.Queue()
+    app.client = None
+    app.active_flow_kind = ""
+    app.active_flow_sn = ""
+    app.last_half_sn = ""
+
+    class FakeText:
+        def __init__(self) -> None:
+            self.chunks: list[str] = []
+
+        def insert(self, _index, text: str) -> None:
+            self.chunks.append(text)
+
+        def delete(self, *_args) -> None:
+            return None
+
+        def see(self, *_args) -> None:
+            return None
+
+    app.log_text = FakeText()
+    _assert(not app._should_render_log("TX", "AT"), "OP mode should hide TX")
+    _assert(not app._should_render_log("RX", "OK"), "OP mode should hide RX")
+    _assert(app._should_render_log("INFO", "step"), "OP mode should show INFO")
+    app.engineering_mode = True
+    _assert(app._should_render_log("TX", "AT"), "engineering mode should show TX")
+    app.engineering_mode = False
+
+    app._append_log_lines(["[INFO] a", "[INFO] b"])
+    _assert(app._ui_metrics["insert_calls"] == 1, "batch insert expected one call")
+    _assert(app._ui_metrics["see_calls"] == 1, "batch see expected one call")
+
+    order: list[str] = []
+    app._set_busy = lambda value: order.append(f"busy:{value}")  # type: ignore[method-assign]
+    app._put_step = lambda *args: order.append(f"step:{args[0]}")  # type: ignore[method-assign]
+    app._show_flow_done_popup = lambda _outcome: order.append("flow_popup")  # type: ignore[method-assign]
+    app.after = lambda _ms, _fn: None  # type: ignore[method-assign]
+
+    app.events.put(("log", "INFO", "before"))
+    app.events.put(("step", 1, "AT probe", "RUN", "cmd"))
+    app.events.put(("log", "INFO", "after"))
+    app.events.put(("busy", True))
+    before_insert = app._ui_metrics["insert_calls"]
+    app._poll_events()
+    _assert(order[:2] == ["step:1", "busy:True"], f"control events not prioritized: {order}")
+    _assert(app._ui_metrics["insert_calls"] == before_insert + 1, "poll should batch logs into one insert")
+    _assert(app._ui_metrics["log_events"] == 2, "both log events should be counted")
+    _assert(app._ui_metrics["control_events"] >= 2, "control events should be counted")
+
+
 def main() -> int:
     tests = [
         test_sensitive_factory_tokens_are_redacted,
         test_engineer_password_and_saved_token,
+        test_save_engineer_password_sha256_only,
         test_unlock_failure_cleanup,
         test_sn_disabled_half_flow_skips_sn_commands,
         test_sn_disabled_half_without_token_skips_factory_gate,
@@ -1241,6 +1400,7 @@ def main() -> int:
         test_capture_output_mode_legacy_fallback,
         test_compact_parser_and_unified_log,
         test_split_record_output_writes_compatibility_files,
+        test_ui_log_batch_op_filter_and_poll_split,
         test_cli_half_full_sn_modes,
         test_cli_half_flash_before_test,
         test_cli_half_flash_reconnect_failure_stops_flow,

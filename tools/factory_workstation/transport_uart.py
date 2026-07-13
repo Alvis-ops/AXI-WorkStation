@@ -23,7 +23,7 @@ def list_serial_ports() -> list[SerialPortInfo]:
 
 
 class UARTTransport:
-    def __init__(self, port: str, baudrate: int = 115200) -> None:
+    def __init__(self, port: str, baudrate: int = 460800) -> None:
         try:
             import serial
         except ImportError as exc:

@@ -7,7 +7,7 @@ param(
     [string]$NordicCliInstallerPath = "",
     [string]$FirmwareHexPath = "",
     [string]$OutputDir = "",
-    [string]$PackageRevision = "r3",
+    [string]$PackageRevision = "r7",
     [switch]$DownloadVcRedist,
     [switch]$SkipNrfConnect,
     [switch]$SkipJLink,

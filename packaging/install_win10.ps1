@@ -320,7 +320,7 @@ Write-Host "Remove this folder manually if you also want to delete config, token
         $uninstallKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\AxiFactoryWorkstation"
         New-Item -Path $uninstallKey -Force | Out-Null
         New-ItemProperty -Path $uninstallKey -Name "DisplayName" -Value "Axi Factory Workstation" -PropertyType String -Force | Out-Null
-        New-ItemProperty -Path $uninstallKey -Name "DisplayVersion" -Value "2026.07.06-r5" -PropertyType String -Force | Out-Null
+        New-ItemProperty -Path $uninstallKey -Name "DisplayVersion" -Value "2026.07.10-r7" -PropertyType String -Force | Out-Null
         New-ItemProperty -Path $uninstallKey -Name "Publisher" -Value "AXI" -PropertyType String -Force | Out-Null
         New-ItemProperty -Path $uninstallKey -Name "InstallLocation" -Value $installRoot -PropertyType String -Force | Out-Null
         New-ItemProperty -Path $uninstallKey -Name "UninstallString" -Value "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$uninstallPath`"" -PropertyType String -Force | Out-Null

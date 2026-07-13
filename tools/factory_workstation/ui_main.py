@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import queue
-import subprocess
 import threading
 import time
 import tkinter as tk
 from dataclasses import replace
-from tkinter import filedialog, messagebox, simpledialog
+from tkinter import filedialog, messagebox
 from pathlib import Path
 
 import ttkbootstrap as ttk
@@ -16,8 +15,10 @@ from .at_parser import capture_frame_label, is_capture_frame_line
 from .config import (
     WorkstationConfig,
     get_factory_token,
+    has_engineer_password,
     load_config,
     redact_sensitive_text,
+    save_engineer_password,
     save_factory_token,
     save_config,
     verify_engineer_password,
@@ -29,6 +30,26 @@ from .ota_runner import build_ota_command, run_ota
 from .storage import NullRunRecord, RunStorage
 from .transport_ble import BLEDeviceInfo, BLENusTransport, scan_ble_devices
 from .transport_uart import UARTTransport, list_serial_ports
+
+# P1_1 UI smoothness (A1/A2/A4)
+UI_EVENT_MAX_DRAIN = 80
+UI_LOG_MAX_LINES = 900
+# Resize fires many Configure events; settle before relayout to keep drag smooth.
+UI_RESIZE_SETTLE_MS = 120
+UI_STEP_STATUS_REFRESH_MS = 16
+UI_CONTROL_EVENT_KINDS = frozenset(
+    {
+        "busy",
+        "connected",
+        "connection_status",
+        "connection_lost",
+        "step",
+        "operator_prompt",
+        "popup",
+        "flow_done",
+        "ble_devices",
+    }
+)
 
 
 STEP_LABELS_ZH = {
@@ -84,14 +105,11 @@ STEP_STATUS_ZH = {
 }
 
 STEP_STATUS_COLORS = {
-    "RUN": "#006DFF",
     "PASS": "#00A63E",
     "OK": "#00A63E",
-    "WARN": "#C97800",
     "NG": "#E00000",
     "FAIL": "#E00000",
     "ERR": "#E00000",
-    "PENDING-HW": "#C97800",
 }
 
 MOMO_TOUCH_STEPS = {"Touch ISR"}
@@ -132,14 +150,33 @@ class WorkstationApp(ttk.Window):
         self.ble_devices: list[BLEDeviceInfo] = []
         self.step_status_labels: dict[str, tk.Label] = {}
         self.step_status_state: dict[str, tuple[str, str]] = {}
+        self._step_tree_values: dict[str, tuple[str, str]] = {}
+        self._step_label_bbox: dict[str, tuple[int, int, int, int]] = {}
+        self._step_status_layout_retries = 0
+        self._step_tree_last_size: tuple[int, int] = (0, 0)
         self._step_tree_compact_columns: bool | None = None
         self._step_status_refresh_job: str | None = None
+        self._step_status_configure_job: str | None = None
+        self._window_resize_job: str | None = None
+        self._pending_window_size: tuple[int, int] | None = None
+        self._last_window_size: tuple[int, int] = (0, 0)
+        self._resize_active = False
+        self._step_status_refresh_deferred = False
+        self._log_autoscroll_deferred = False
         self._help_panel_built = False
         self.active_flow_kind = ""
         self.active_flow_sn = ""
         self.last_half_sn = ""
         self.engineering_mode = False
         self.active_momo_prompt: tk.Toplevel | None = None
+        self._log_line_count = 0
+        self._ui_metrics = {
+            "insert_calls": 0,
+            "see_calls": 0,
+            "ticks": 0,
+            "control_events": 0,
+            "log_events": 0,
+        }
         self._build_vars()
         self._build_style()
         self._build_ui()
@@ -149,6 +186,113 @@ class WorkstationApp(ttk.Window):
         self._restore_main_sash()
         self.bind("<Configure>", self._on_window_configure)
         self.after(80, self._poll_events)
+        self._ensure_initial_credentials()
+
+    def _ensure_initial_credentials(self) -> None:
+        if has_engineer_password(self.config_model):
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title("首次设置")
+        dialog.transient(self)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+
+        setup_ok = {"value": False}
+
+        def cancel_setup() -> None:
+            if dialog.winfo_exists():
+                dialog.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", cancel_setup)
+
+        body = ttk.Frame(dialog, padding=20)
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            body,
+            text="本工位尚未配置工程密码。\n请先设置工程密码后才能进入主界面。\n工厂 token 可留空，稍后工程登录再设置。",
+            justify=tk.LEFT,
+            wraplength=420,
+        ).grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 14))
+
+        password_var = tk.StringVar()
+        confirm_var = tk.StringVar()
+        token_var = tk.StringVar()
+        show_secrets = tk.BooleanVar(value=False)
+
+        ttk.Label(body, text="工程密码").grid(row=1, column=0, sticky=tk.W, pady=4)
+        password_entry = ttk.Entry(body, textvariable=password_var, show="*", width=36)
+        password_entry.grid(row=1, column=1, sticky=tk.EW, pady=4, padx=(10, 0))
+
+        ttk.Label(body, text="确认密码").grid(row=2, column=0, sticky=tk.W, pady=4)
+        confirm_entry = ttk.Entry(body, textvariable=confirm_var, show="*", width=36)
+        confirm_entry.grid(row=2, column=1, sticky=tk.EW, pady=4, padx=(10, 0))
+
+        ttk.Label(body, text="工厂 token（可选）").grid(row=3, column=0, sticky=tk.W, pady=4)
+        token_entry = ttk.Entry(body, textvariable=token_var, show="*", width=36)
+        token_entry.grid(row=3, column=1, sticky=tk.EW, pady=4, padx=(10, 0))
+
+        def toggle_secret_visibility() -> None:
+            mask = "" if show_secrets.get() else "*"
+            password_entry.configure(show=mask)
+            confirm_entry.configure(show=mask)
+            token_entry.configure(show=mask)
+
+        ttk.Checkbutton(
+            body,
+            text="显示输入内容",
+            variable=show_secrets,
+            command=toggle_secret_visibility,
+            bootstyle="round-toggle",
+        ).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
+
+        error_var = tk.StringVar()
+        ttk.Label(body, textvariable=error_var, foreground="#B91C1C", wraplength=420).grid(
+            row=5, column=0, columnspan=2, sticky=tk.W, pady=(8, 0)
+        )
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=6, column=0, columnspan=2, sticky=tk.E, pady=(16, 0))
+
+        def save_setup() -> None:
+            password = password_var.get().strip()
+            confirm = confirm_var.get().strip()
+            token = token_var.get().strip()
+            if not password:
+                error_var.set("请输入工程密码。")
+                return
+            if password != confirm:
+                error_var.set("两次输入的工程密码不一致。")
+                return
+            try:
+                save_engineer_password(password)
+                if token:
+                    save_factory_token(token)
+            except Exception as exc:
+                error_var.set(f"保存失败：{exc}")
+                return
+            setup_ok["value"] = True
+            self.token_var.set("")
+            self._sync_auth_status()
+            self._log("OK", "首次工程密码已保存")
+            if token:
+                self._log("OK", "首次工厂 token 已保存")
+            dialog.destroy()
+
+        ttk.Button(buttons, text="取消并退出", bootstyle="secondary-outline", command=cancel_setup).pack(
+            side=tk.LEFT, padx=(0, 8)
+        )
+        ttk.Button(buttons, text="保存并进入", bootstyle="primary", command=save_setup).pack(side=tk.LEFT)
+
+        body.columnconfigure(1, weight=1)
+        dialog.update_idletasks()
+        x = max(0, self.winfo_rootx() + (self.winfo_width() - dialog.winfo_width()) // 2)
+        y = max(0, self.winfo_rooty() + (self.winfo_height() - dialog.winfo_height()) // 2)
+        dialog.geometry(f"+{x}+{y}")
+        password_entry.focus_set()
+        self.wait_window(dialog)
+        if not setup_ok["value"]:
+            self.destroy()
+
 
     def _window_bounds(self) -> tuple[int, int, int, int]:
         screen_width = max(800, self.winfo_screenwidth())
@@ -176,19 +320,59 @@ class WorkstationApp(ttk.Window):
     def _on_window_configure(self, event) -> None:
         if event.widget is not self:
             return
-        self.compact_layout = event.width < 1280 or event.height < 760
-        if self.compact_layout == self._last_layout_compact:
+        size = (int(event.width), int(event.height))
+        # Title-bar move fires Configure with unchanged size; ignore.
+        if size == self._last_window_size and self._window_resize_job is None:
             return
-        self._last_layout_compact = self.compact_layout
-        self._apply_responsive_layout()
+        self._resize_active = True
+        self._pending_window_size = size
+        if self._window_resize_job is not None:
+            try:
+                self.after_cancel(self._window_resize_job)
+            except tk.TclError:
+                pass
+        # Continuous resize: apply layout once after the drag settles.
+        self._window_resize_job = self.after(UI_RESIZE_SETTLE_MS, self._on_window_resize_settled)
+
+    def _on_window_resize_settled(self) -> None:
+        self._window_resize_job = None
+        size = self._pending_window_size
+        if size is None:
+            self._resize_active = False
+            self._flush_resize_deferred_ui()
+            return
+        if size == self._last_window_size:
+            self._resize_active = False
+            self._flush_resize_deferred_ui()
+            return
+        self._last_window_size = size
+        compact = size[0] < 1280 or size[1] < 760
+        if compact != self._last_layout_compact:
+            self.compact_layout = compact
+            self._last_layout_compact = compact
+            self._apply_responsive_layout()
+        elif hasattr(self, "step_tree"):
+            # Size changed but compact mode did not: only refresh status overlays once.
+            self._schedule_step_status_refresh(0, force_relayout=True)
+        self._resize_active = False
+        self._flush_resize_deferred_ui()
+
+    def _flush_resize_deferred_ui(self) -> None:
+        if self._step_status_refresh_deferred and hasattr(self, "step_tree"):
+            self._step_status_refresh_deferred = False
+            self._schedule_step_status_refresh(0, force_relayout=True)
+        if self._log_autoscroll_deferred and hasattr(self, "log_text"):
+            self._log_autoscroll_deferred = False
+            self._scroll_log_to_end()
 
     def _target_left_width(self, total_width: int | None = None) -> int:
         if total_width is None:
             total_width = max(self.winfo_width(), getattr(self, "_initial_window_width", 0), 1360)
-        target = int(total_width * 0.48)
+        # Default left:right = 4:6
+        target = int(total_width * 0.4)
         if self.compact_layout:
-            return max(380, min(620, target))
-        return max(640, min(1120, target))
+            return max(320, min(560, target))
+        return max(520, min(960, target))
 
     def _apply_responsive_layout(self) -> None:
         left_width = self._target_left_width()
@@ -204,7 +388,7 @@ class WorkstationApp(ttk.Window):
         if hasattr(self, "step_tree"):
             self.step_tree.configure(height=7 if self.compact_layout else 10)
             self._configure_step_tree_columns()
-            self._schedule_step_status_refresh()
+            self._schedule_step_status_refresh(0, force_relayout=True)
         if hasattr(self, "log_text"):
             self.log_text.configure(
                 height=7 if self.compact_layout else 12,
@@ -238,8 +422,23 @@ class WorkstationApp(ttk.Window):
             self.step_tree.column(column, width=width, minwidth=minwidth, stretch=stretch)
 
     def _on_step_tree_configure(self) -> None:
+        width = max(self.step_tree.winfo_width(), 1)
+        height = max(self.step_tree.winfo_height(), 1)
+        size = (width, height)
+        if size == self._step_tree_last_size:
+            return
+        self._step_tree_last_size = size
+        if self._step_status_configure_job is not None:
+            try:
+                self.after_cancel(self._step_status_configure_job)
+            except tk.TclError:
+                pass
+        self._step_status_configure_job = self.after(UI_RESIZE_SETTLE_MS, self._on_step_tree_configure_settled)
+
+    def _on_step_tree_configure_settled(self) -> None:
+        self._step_status_configure_job = None
         self._configure_step_tree_columns()
-        self._schedule_step_status_refresh(60)
+        self._schedule_step_status_refresh(0, force_relayout=True)
 
     def _set_main_sash(self, left_width: int) -> None:
         try:
@@ -260,16 +459,49 @@ class WorkstationApp(ttk.Window):
         scrollbar = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=canvas.yview)
         content = ttk.Frame(canvas, padding=10)
         window_id = canvas.create_window((0, 0), window=content, anchor=tk.NW)
+        last_canvas_width = {"value": -1}
+        last_scroll_region = {"value": None}
+        pending_canvas_width: dict[str, int | None] = {"value": None}
+        layout_job: dict[str, str | None] = {"value": None}
 
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
+        def apply_scrollable_layout() -> None:
+            layout_job["value"] = None
+            width = pending_canvas_width["value"]
+            pending_canvas_width["value"] = None
+            if width is not None and width != last_canvas_width["value"]:
+                last_canvas_width["value"] = width
+                canvas.itemconfigure(window_id, width=width)
+            region = canvas.bbox("all")
+            if region == last_scroll_region["value"]:
+                return
+            last_scroll_region["value"] = region
+            canvas.configure(scrollregion=region)
+
+        def schedule_scrollable_layout() -> None:
+            job = layout_job["value"]
+            if job is not None:
+                try:
+                    self.after_cancel(job)
+                except tk.TclError:
+                    pass
+            if self._resize_active:
+                layout_job["value"] = self.after(UI_RESIZE_SETTLE_MS, apply_scrollable_layout)
+            else:
+                layout_job["value"] = self.after_idle(apply_scrollable_layout)
+
         def update_scroll_region(_event=None) -> None:
-            canvas.configure(scrollregion=canvas.bbox("all"))
+            schedule_scrollable_layout()
 
         def fit_content_width(event) -> None:
-            canvas.itemconfigure(window_id, width=event.width)
+            width = int(event.width)
+            if width == last_canvas_width["value"] and pending_canvas_width["value"] is None:
+                return
+            pending_canvas_width["value"] = width
+            schedule_scrollable_layout()
 
         def on_mousewheel(event) -> str:
             canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
@@ -329,6 +561,7 @@ class WorkstationApp(ttk.Window):
             "Step.Treeview",
             font=("Microsoft YaHei UI", 11),
             rowheight=36,
+            foreground="#111827",
         )
         style.configure(
             "Step.Treeview.Heading",
@@ -550,11 +783,11 @@ class WorkstationApp(ttk.Window):
 
         self.flash_run_btn = ttk.Button(frame, text="开始烧录", bootstyle="danger", command=self._run_flash)
         self.flash_run_btn.grid(row=9, column=0, columnspan=3, sticky=tk.EW, pady=(8, 4))
-        self.flash_probe_btn = ttk.Button(frame, text="探测 J-Link", bootstyle="secondary", command=self._probe_jlink)
+        self.flash_probe_btn = ttk.Button(frame, text="烧录检测", bootstyle="secondary", command=self._run_flash_precheck)
         self.flash_probe_btn.grid(row=10, column=0, columnspan=3, sticky=tk.EW, pady=4)
         ttk.Label(
             frame,
-            text="独立烧录属于工程操作，需要工程师登录。半机测试前自动烧录在“设置”中启用。",
+            text="独立烧录属于工程操作，需要工程师登录。开始烧录不再自动预检；需要时点“烧录检测”。半机测试前自动烧录在“设置”中启用。",
             wraplength=300,
             foreground="#6B7280",
         ).grid(row=11, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
@@ -909,9 +1142,14 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
             self.step_tree.heading(col, text=title)
         self._configure_step_tree_columns()
         self.step_tree.bind("<Configure>", lambda _e: self._on_step_tree_configure())
-        self.step_tree.bind("<ButtonRelease-1>", lambda _e: self._schedule_step_status_refresh())
-        self.step_tree.bind("<KeyRelease>", lambda _e: self._schedule_step_status_refresh())
-        self.step_tree.bind("<MouseWheel>", lambda _e: self._schedule_step_status_refresh())
+        self.step_tree.bind(
+            "<ButtonRelease-1>",
+            lambda _e: self._schedule_step_status_refresh(UI_STEP_STATUS_REFRESH_MS),
+        )
+        self.step_tree.bind(
+            "<KeyRelease>",
+            lambda _e: self._schedule_step_status_refresh(UI_STEP_STATUS_REFRESH_MS),
+        )
         self.step_tree.pack(fill=tk.BOTH, expand=True)
 
         log_header = ttk.Frame(parent)
@@ -1051,6 +1289,7 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
         return replace(self.config_model, flash_image_path=self.config_model.half_flash_image_path)
 
     def _validate_flash_ready(self, config: WorkstationConfig | None = None, *, half_flow: bool = False) -> bool:
+        """Fast local checks only. Full J-Link/nrfjprog probe is manual via 烧录检测."""
         cfg = config or self.config_model
         image = str(cfg.flash_image_path or "").strip()
         backend = str(cfg.flash_backend or "nrfjprog").strip() or "nrfjprog"
@@ -1069,19 +1308,6 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
                 return False
         else:
             messagebox.showerror("烧录方式无效", f"不支持的烧录方式：{backend}")
-            return False
-        precheck = precheck_flash_request(
-            cfg,
-            sn_enabled=bool(self.sn_enabled_var.get()),
-            dry_run=not bool(self.sn_enabled_var.get()),
-        )
-        if precheck.level == "WARN":
-            self._log("WARN", f"烧录预检: {precheck.message}")
-            if not messagebox.askyesno("烧录预检警告", f"{precheck.message}\n\n是否继续？"):
-                return False
-        if not precheck.ok:
-            messagebox.showerror("烧录预检失败", precheck.message)
-            self._log("ERR", f"烧录预检失败: {precheck.message}")
             return False
         return True
 
@@ -1120,31 +1346,37 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _probe_jlink(self) -> None:
+    def _run_flash_precheck(self) -> None:
         if self.busy:
             return
         if not self.engineering_mode:
-            messagebox.showwarning("需要工程登录", "J-Link 探测属于工程操作，请先在“更多”中工程登录。")
+            messagebox.showwarning("需要工程登录", "烧录检测属于工程操作，请先在“更多”中工程登录。")
             return
         self._save_settings(silent=True)
         self._set_busy(True)
 
         def worker() -> None:
             try:
-                tool = self.config_model.nrfjprog_path or "nrfjprog"
-                proc = subprocess.run(
-                    [tool, "--ids"],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=15,
+                precheck = precheck_flash_request(
+                    self.config_model,
+                    sn_enabled=bool(self.sn_enabled_var.get()),
+                    dry_run=not bool(self.sn_enabled_var.get()),
                 )
-                output = (proc.stdout or proc.stderr or "").strip()
-                level = "OK" if proc.returncode == 0 else "ERR"
-                self.events.put(("log", level, f"nrfjprog --ids exit={proc.returncode} {output}"))
+                detail = precheck.message
+                if precheck.probe_ids:
+                    detail = f"{detail}\n探针: {', '.join(precheck.probe_ids)}"
+                if precheck.ok and precheck.level != "WARN":
+                    self.events.put(("log", "OK", f"烧录检测通过: {precheck.message}"))
+                    self.events.put(("popup", "info", "烧录检测通过", detail))
+                elif precheck.ok:
+                    self.events.put(("log", "WARN", f"烧录检测警告: {precheck.message}"))
+                    self.events.put(("popup", "warning", "烧录检测警告", detail))
+                else:
+                    self.events.put(("log", "ERR", f"烧录检测失败: {precheck.message}"))
+                    self.events.put(("popup", "error", "烧录检测失败", detail))
             except Exception as exc:
-                self.events.put(("log", "ERR", f"J-Link 探测失败: {exc}"))
+                self.events.put(("log", "ERR", f"烧录检测失败: {exc}"))
+                self.events.put(("popup", "error", "烧录检测失败", str(exc)))
             finally:
                 self.events.put(("busy", False))
 
@@ -1274,14 +1506,87 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
         )
         self._sync_auth_status()
 
+    def _ask_secret(
+        self,
+        title: str,
+        prompt: str,
+        *,
+        allow_empty: bool = False,
+    ) -> str | None:
+        dialog = tk.Toplevel(self)
+        dialog.title(title)
+        dialog.transient(self)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+
+        result: dict[str, str | None] = {"value": None}
+
+        def close_dialog() -> None:
+            if dialog.winfo_exists():
+                dialog.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+
+        body = ttk.Frame(dialog, padding=18)
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(body, text=prompt, justify=tk.LEFT, wraplength=360).grid(
+            row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 10)
+        )
+
+        value_var = tk.StringVar()
+        show_secret = tk.BooleanVar(value=False)
+        entry = ttk.Entry(body, textvariable=value_var, show="*", width=36)
+        entry.grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=4)
+
+        def toggle_visibility() -> None:
+            entry.configure(show="" if show_secret.get() else "*")
+
+        ttk.Checkbutton(
+            body,
+            text="显示输入内容",
+            variable=show_secret,
+            command=toggle_visibility,
+            bootstyle="round-toggle",
+        ).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
+
+        error_var = tk.StringVar()
+        ttk.Label(body, textvariable=error_var, foreground="#B91C1C").grid(
+            row=3, column=0, columnspan=2, sticky=tk.W, pady=(6, 0)
+        )
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=4, column=0, columnspan=2, sticky=tk.E, pady=(14, 0))
+
+        def confirm() -> None:
+            value = value_var.get().strip()
+            if not value and not allow_empty:
+                error_var.set("请输入内容。")
+                return
+            result["value"] = value
+            close_dialog()
+
+        ttk.Button(buttons, text="取消", bootstyle="secondary-outline", command=close_dialog).pack(
+            side=tk.LEFT, padx=(0, 8)
+        )
+        ttk.Button(buttons, text="确定", bootstyle="primary", command=confirm).pack(side=tk.LEFT)
+
+        body.columnconfigure(0, weight=1)
+        dialog.update_idletasks()
+        x = max(0, self.winfo_rootx() + (self.winfo_width() - dialog.winfo_width()) // 2)
+        y = max(0, self.winfo_rooty() + (self.winfo_height() - dialog.winfo_height()) // 2)
+        dialog.geometry(f"+{x}+{y}")
+        entry.focus_set()
+        self.wait_window(dialog)
+        return result["value"]
+
     def _login_engineering(self) -> None:
-        password = simpledialog.askstring("工程登录", "请输入工程密码：", show="*", parent=self)
+        password = self._ask_secret("工程登录", "请输入工程密码：")
         if password is None:
             return
         if not verify_engineer_password(password, self.config_model):
             messagebox.showerror(
                 "工程登录失败",
-                "工程密码不正确，或尚未在 .env / 环境变量中配置工程密码。",
+                "工程密码不正确。",
             )
             self._log("WARN", "工程登录失败")
             return
@@ -1293,7 +1598,7 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
         if not self.engineering_mode:
             messagebox.showwarning("需要工程登录", "请先在“更多”中完成工程登录。")
             return
-        token = simpledialog.askstring("设置运行 token", "请输入设备工厂 token：", show="*", parent=self)
+        token = self._ask_secret("设置运行 token", "请输入设备工厂 token：")
         if token is None:
             return
         try:
@@ -1441,6 +1746,7 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
                     if count == 1 or count % 10 == 0:
                         self.events.put(("log", "INFO", f"{label}: 已接收 {count} 帧"))
                     return
+                # A3: always enqueue; OP filtering happens in UI render path only.
                 self.events.put(("log", direction, line))
 
             def progress(index: int, label: str, status: str, detail: str) -> None:
@@ -1770,29 +2076,63 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
             label.destroy()
         self.step_status_labels.clear()
         self.step_status_state.clear()
+        self._step_tree_values.clear()
+        self._step_label_bbox.clear()
+        self._step_status_layout_retries = 0
         if self._step_status_refresh_job is not None:
             try:
                 self.after_cancel(self._step_status_refresh_job)
             except tk.TclError:
                 pass
             self._step_status_refresh_job = None
+        if self._step_status_configure_job is not None:
+            try:
+                self.after_cancel(self._step_status_configure_job)
+            except tk.TclError:
+                pass
+            self._step_status_configure_job = None
 
-    def _schedule_step_status_refresh(self, delay_ms: int = 25) -> None:
+    def _schedule_step_status_refresh(
+        self,
+        delay_ms: int = UI_STEP_STATUS_REFRESH_MS,
+        *,
+        force_relayout: bool = False,
+    ) -> None:
+        if force_relayout:
+            self._step_label_bbox.clear()
+            self._step_status_layout_retries = 0
+            if self._resize_active:
+                self._step_status_refresh_deferred = True
+                return
         if self._step_status_refresh_job is not None:
             try:
                 self.after_cancel(self._step_status_refresh_job)
             except tk.TclError:
                 pass
-        self._step_status_refresh_job = self.after(delay_ms, self._refresh_step_status_labels)
+        if delay_ms <= 0:
+            self._step_status_refresh_job = self.after_idle(self._refresh_step_status_labels)
+        else:
+            self._step_status_refresh_job = self.after(delay_ms, self._refresh_step_status_labels)
 
     def _refresh_step_status_labels(self) -> None:
         self._step_status_refresh_job = None
+        pending_layout = False
         for iid, (display_status, status_key) in list(self.step_status_state.items()):
             if not self.step_tree.exists(iid):
                 label = self.step_status_labels.pop(iid, None)
                 if label is not None:
                     label.destroy()
                 self.step_status_state.pop(iid, None)
+                self._step_label_bbox.pop(iid, None)
+                continue
+
+            color = STEP_STATUS_COLORS.get(status_key)
+            if color is None:
+                # Non PASS/NG statuses stay as plain black Treeview text.
+                label = self.step_status_labels.pop(iid, None)
+                if label is not None:
+                    label.destroy()
+                self._step_label_bbox.pop(iid, None)
                 continue
 
             label = self.step_status_labels.get(iid)
@@ -1807,20 +2147,45 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
                 label.bind("<Button-1>", lambda _e, row=iid: self.step_tree.selection_set(row))
                 self.step_status_labels[iid] = label
 
-            label.configure(text=display_status, fg=STEP_STATUS_COLORS.get(status_key, "#111827"))
+            if str(label.cget("text")) != display_status or str(label.cget("fg")) != color:
+                label.configure(text=display_status, fg=color)
+            if self._resize_active:
+                self._step_status_refresh_deferred = True
+                continue
             bbox = self.step_tree.bbox(iid, "status")
             if bbox:
                 x, y, width, height = bbox
-                label.place(x=x + 1, y=y + 1, width=max(0, width - 2), height=max(0, height - 2))
+                prev = self._step_label_bbox.get(iid)
+                if prev != bbox:
+                    label.place(x=x + 1, y=y + 1, width=max(0, width - 2), height=max(0, height - 2))
+                    self._step_label_bbox[iid] = bbox
             else:
-                label.place_forget()
+                pending_layout = True
+        if pending_layout and self.step_status_state and self._step_status_layout_retries < 2:
+            self._step_status_layout_retries += 1
+            self._step_status_refresh_job = self.after(16, self._refresh_step_status_labels)
+        else:
+            self._step_status_layout_retries = 0
+            if pending_layout:
+                for iid, label in list(self.step_status_labels.items()):
+                    if iid in self._step_label_bbox:
+                        continue
+                    if self.step_tree.bbox(iid, "status"):
+                        continue
+                    label.place_forget()
 
     def _put_step(self, idx: int, step: str, status: str, detail: str) -> None:
         iid = str(idx)
         status_key = status.upper()
         display_step = STEP_LABELS_ZH.get(step, step)
         display_status = STEP_STATUS_ZH.get(status_key, status)
-        values = (idx, display_step, "", detail)
+        # Keep status text in the tree for non-colored states; colored PASS/NG use overlay.
+        tree_status = "" if status_key in STEP_STATUS_COLORS else display_status
+        values = (idx, display_step, tree_status, detail)
+        dedupe_key = (status_key, detail)
+        if self._step_tree_values.get(iid) == dedupe_key and self.step_tree.exists(iid):
+            return
+        self._step_tree_values[iid] = dedupe_key
         self.step_status_state[iid] = (display_status, status_key)
         if self.step_tree.exists(iid):
             self.step_tree.item(iid, values=values)
@@ -1831,53 +2196,116 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
         if step in MOMO_TOUCH_STEPS and status_key in {"PASS", "OK"}:
             self._close_active_momo_prompt()
 
-    def _log(self, level: str, message: str) -> None:
-        self.log_text.insert(tk.END, f"[{level}] {message}\n")
+    def _should_render_log(self, level: str, message: str) -> bool:
+        # A3: OP mode hides verbose AT TX/RX; keep INFO/OK/WARN/ERR and step summaries.
+        if self.engineering_mode:
+            return True
+        if level in {"TX", "RX"}:
+            return False
+        return True
+
+    def _append_log_lines(self, lines: list[str]) -> None:
+        if not lines:
+            return
+        block = "\n".join(lines) + "\n"
+        self.log_text.insert(tk.END, block)
+        self._ui_metrics["insert_calls"] += 1
+        self._log_line_count += len(lines)
+        overflow = self._log_line_count - UI_LOG_MAX_LINES
+        if overflow > 0:
+            self.log_text.delete("1.0", f"{overflow + 1}.0")
+            self._log_line_count = UI_LOG_MAX_LINES
+        if self._resize_active:
+            self._log_autoscroll_deferred = True
+            return
+        self._scroll_log_to_end()
+
+    def _scroll_log_to_end(self) -> None:
         self.log_text.see(tk.END)
+        self._ui_metrics["see_calls"] += 1
+
+    def _log(self, level: str, message: str) -> None:
+        if not self._should_render_log(level, message):
+            return
+        self._append_log_lines([f"[{level}] {message}"])
 
     def _clear_log(self) -> None:
         self.log_text.delete("1.0", tk.END)
+        self._log_line_count = 0
+
+    def _dispatch_control_event(self, event: tuple) -> None:
+        kind = event[0]
+        self._ui_metrics["control_events"] += 1
+        if kind == "busy":
+            self._set_busy(event[1])
+        elif kind == "connected":
+            self.client = event[1]
+            mode = event[2] if len(event) > 3 else "UART"
+            detail = event[3] if len(event) > 3 else event[2]
+            self._set_connection_status(mode, detail)
+            self._log("OK", f"已连接 {mode} {detail}")
+        elif kind == "connection_status":
+            self._set_connection_status(event[1], event[2])
+        elif kind == "connection_lost":
+            self._close_dead_client()
+            self._log("WARN", "BLE 连接已断开，请重新连接后再测试")
+        elif kind == "step":
+            self._put_step(event[1], event[2], event[3], event[4])
+        elif kind == "operator_prompt":
+            block_flow = event[6] if len(event) > 6 else True
+            try:
+                self._show_operator_prompt(event[1], event[2], event[3], event[4], block_flow)
+            finally:
+                event[5].set()
+        elif kind == "popup":
+            self._show_popup(event[1], event[2], event[3])
+        elif kind == "flow_done":
+            outcome: FlowOutcome = event[1]
+            self._log("OK" if outcome.ok else "ERR", f"流程结束: {outcome.result} {outcome.message}")
+            if outcome.ok and self.active_flow_kind == "half" and self.active_flow_sn:
+                self.last_half_sn = self.active_flow_sn
+            self._show_flow_done_popup(outcome)
+        elif kind == "ble_devices":
+            self._update_ble_devices(event[1])
 
     def _poll_events(self) -> None:
+        self._ui_metrics["ticks"] += 1
+        snapshot: list[tuple] = []
         try:
-            while True:
-                event = self.events.get_nowait()
-                kind = event[0]
-                if kind == "log":
-                    self._log(event[1], event[2])
-                elif kind == "busy":
-                    self._set_busy(event[1])
-                elif kind == "connected":
-                    self.client = event[1]
-                    mode = event[2] if len(event) > 3 else "UART"
-                    detail = event[3] if len(event) > 3 else event[2]
-                    self._set_connection_status(mode, detail)
-                    self._log("OK", f"已连接 {mode} {detail}")
-                elif kind == "connection_status":
-                    self._set_connection_status(event[1], event[2])
-                elif kind == "connection_lost":
-                    self._close_dead_client()
-                    self._log("WARN", "BLE 连接已断开，请重新连接后再测试")
-                elif kind == "step":
-                    self._put_step(event[1], event[2], event[3], event[4])
-                elif kind == "operator_prompt":
-                    block_flow = event[6] if len(event) > 6 else True
-                    try:
-                        self._show_operator_prompt(event[1], event[2], event[3], event[4], block_flow)
-                    finally:
-                        event[5].set()
-                elif kind == "popup":
-                    self._show_popup(event[1], event[2], event[3])
-                elif kind == "flow_done":
-                    outcome: FlowOutcome = event[1]
-                    self._log("OK" if outcome.ok else "ERR", f"流程结束: {outcome.result} {outcome.message}")
-                    if outcome.ok and self.active_flow_kind == "half" and self.active_flow_sn:
-                        self.last_half_sn = self.active_flow_sn
-                    self._show_flow_done_popup(outcome)
-                elif kind == "ble_devices":
-                    self._update_ble_devices(event[1])
+            while len(snapshot) < UI_EVENT_MAX_DRAIN:
+                snapshot.append(self.events.get_nowait())
         except queue.Empty:
             pass
+
+        control_events = [event for event in snapshot if event and event[0] in UI_CONTROL_EVENT_KINDS]
+        log_events = [event for event in snapshot if event and event[0] == "log"]
+        # Unknown kinds: treat as control so they are not dropped.
+        other_events = [
+            event
+            for event in snapshot
+            if event and event[0] not in UI_CONTROL_EVENT_KINDS and event[0] != "log"
+        ]
+
+        for event in control_events + other_events:
+            if event[0] == "flow_done":
+                # Flush any pending visible logs before showing flow result.
+                pending_lines = [
+                    f"[{item[1]}] {item[2]}"
+                    for item in log_events
+                    if self._should_render_log(item[1], item[2])
+                ]
+                self._append_log_lines(pending_lines)
+                log_events = []
+            self._dispatch_control_event(event)
+
+        rendered: list[str] = []
+        for event in log_events:
+            self._ui_metrics["log_events"] += 1
+            level, message = event[1], event[2]
+            if self._should_render_log(level, message):
+                rendered.append(f"[{level}] {message}")
+        self._append_log_lines(rendered)
+
         self.after(80, self._poll_events)
 
     def _update_ble_devices(self, devices: list[BLEDeviceInfo]) -> None:
@@ -1980,4 +2408,8 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
 
 def main() -> None:
     app = WorkstationApp()
-    app.mainloop()
+    try:
+        if app.winfo_exists():
+            app.mainloop()
+    except tk.TclError:
+        return

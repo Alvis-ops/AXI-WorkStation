@@ -8,8 +8,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .at_parser import int_field, parse_line, split_ints
+from .at_parser import int_field, is_capture_frame_line, parse_line, split_ints
 from .config import redact_sensitive_text
+
+# Batch disk flush: avoid per-row flush syscalls on industrial PCs (P1_1 B1/B1b).
+CSV_FLUSH_EVERY_ROWS = 50
+RAW_LOG_FLUSH_EVERY_LINES = 50
 
 
 def _stamp() -> str:
@@ -29,8 +33,11 @@ def _safe_name(text: str) -> str:
 class CsvSink:
     path: Path
     fieldnames: list[str]
+    flush_every_rows: int = CSV_FLUSH_EVERY_ROWS
     _file: Any = field(default=None, init=False, repr=False)
     _writer: csv.DictWriter | None = field(default=None, init=False, repr=False)
+    _rows_since_flush: int = field(default=0, init=False, repr=False)
+    flush_count: int = field(default=0, init=False, repr=False)
 
     def writerow(self, row: dict[str, Any]) -> None:
         if self._writer is None:
@@ -38,12 +45,22 @@ class CsvSink:
             self._file = self.path.open("w", newline="", encoding="utf-8")
             self._writer = csv.DictWriter(self._file, fieldnames=self.fieldnames, extrasaction="ignore")
             self._writer.writeheader()
+            self._rows_since_flush = 0
         clean = {key: row.get(key, "") for key in self.fieldnames}
         self._writer.writerow(clean)
-        self._file.flush()
+        self._rows_since_flush += 1
+        if self._rows_since_flush >= max(1, int(self.flush_every_rows)):
+            self.flush()
+
+    def flush(self) -> None:
+        if self._file is not None:
+            self._file.flush()
+            self.flush_count += 1
+            self._rows_since_flush = 0
 
     def close(self) -> None:
         if self._file is not None:
+            self.flush()
             self._file.close()
             self._file = None
             self._writer = None
@@ -70,6 +87,8 @@ class RunRecord:
         self._step_name = ""
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.raw_log = (self.run_dir / "raw_at.log").open("a", encoding="utf-8") if self.write_extra_files else None
+        self._raw_log_lines_since_flush = 0
+        self.raw_log_flush_count = 0
         self.sinks: dict[str, CsvSink] = {}
         self.meta = {
             "run_id": self.run_id,
@@ -87,14 +106,29 @@ class RunRecord:
         self.log_event("run_metadata", self.meta)
         self.log_event("flow_start", {"station": station, "sn": sn, "dut_alias": dut_alias})
 
+    def flush_writes(self) -> None:
+        for sink in self.sinks.values():
+            sink.flush()
+        if self.raw_log is not None:
+            self.raw_log.flush()
+            self.raw_log_flush_count += 1
+            self._raw_log_lines_since_flush = 0
+
     def log_at(self, direction: str, line: str) -> None:
         logged_line = redact_sensitive_text(line) if direction == "TX" else line
         if self.raw_log is not None:
             self.raw_log.write(f"{_iso()} {direction} {logged_line}\n")
-            self.raw_log.flush()
-        event_type = {"TX": "at_tx", "RX": "at_rx"}.get(direction, direction.lower())
-        payload_key = "command" if direction == "TX" else "line"
-        self.log_event(event_type, {"direction": direction, payload_key: logged_line}, logged_line)
+            self._raw_log_lines_since_flush += 1
+            if self._raw_log_lines_since_flush >= RAW_LOG_FLUSH_EVERY_LINES:
+                self.raw_log.flush()
+                self.raw_log_flush_count += 1
+                self._raw_log_lines_since_flush = 0
+        # B1a: capture frames skip redundant at_rx; ingest_line still runs below.
+        skip_at_event = direction == "RX" and is_capture_frame_line(line)
+        if not skip_at_event:
+            event_type = {"TX": "at_tx", "RX": "at_rx"}.get(direction, direction.lower())
+            payload_key = "command" if direction == "TX" else "line"
+            self.log_event(event_type, {"direction": direction, payload_key: logged_line}, logged_line)
         if direction == "RX":
             self.ingest_line(line)
 
@@ -198,6 +232,7 @@ class RunRecord:
                 "response_summary": response_summary,
             },
         )
+        self.flush_writes()
 
     def finish(self, result: str, details: str = "") -> None:
         self.log_event("flow_end", {"result": result, "details": details})
@@ -222,9 +257,11 @@ class RunRecord:
                     "details": details,
                 }
             )
+        self.flush_writes()
         self.close()
 
     def close(self) -> None:
+        self.flush_writes()
         for sink in self.sinks.values():
             sink.close()
         if self.raw_log is not None:
