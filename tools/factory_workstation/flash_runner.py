@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,7 @@ from .config import WorkstationConfig
 
 FlashLogCallback = Callable[[str, str], None]
 JLINK_ERROR_256 = "JLinkARM.dll reported error -256"
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def _to_text(value: object) -> str:
@@ -83,6 +85,15 @@ def _require_file(path_text: str, label: str) -> Path:
     return path
 
 
+def _jlink_dll_args(config: WorkstationConfig, *, require_file: bool = True) -> list[str]:
+    dll_path = str(config.jlink_dll_path or "").strip()
+    if not dll_path:
+        return []
+    if require_file:
+        dll_path = str(_require_file(dll_path, "J-Link DLL"))
+    return ["--jdll", dll_path]
+
+
 def build_flash_command(config: WorkstationConfig) -> FlashCommand:
     backend = str(config.flash_backend or "nrfjprog").strip().lower()
     env = os.environ.copy()
@@ -93,7 +104,7 @@ def build_flash_command(config: WorkstationConfig) -> FlashCommand:
     if backend == "nrfjprog":
         image = _require_file(config.flash_image_path, "flash image")
         tool = str(config.nrfjprog_path or "nrfjprog").strip() or "nrfjprog"
-        argv = [tool, "--program", str(image), "--chiperase"]
+        argv = [tool, "--program", str(image), "--chiperase", *_jlink_dll_args(config)]
         if config.flash_verify:
             argv.append("--verify")
         argv.append("--reset")
@@ -155,6 +166,7 @@ def run_flash(config: WorkstationConfig, line_callback: FlashLogCallback | None 
             text=True,
             encoding="utf-8",
             errors="replace",
+            creationflags=CREATE_NO_WINDOW,
         )
         timeout_s = max(1.0, float(getattr(config, "flash_timeout_s", 180.0) or 180.0))
         try:

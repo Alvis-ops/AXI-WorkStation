@@ -106,6 +106,7 @@ class WorkstationConfig:
     flash_timeout_s: float = 180.0
     flash_verify: bool = True
     nrfjprog_path: str = "nrfjprog"
+    jlink_dll_path: str = ""
     jlink_probe_id: str = ""
     uart_port: str = ""
     uart_baudrate: int = 460800
@@ -234,6 +235,7 @@ def _resolve_config_paths(config: WorkstationConfig, base_dir: Path) -> Workstat
     config.flash_image_path = _resolve_path_field(config.flash_image_path, base_dir)
     config.half_flash_image_path = _resolve_path_field(config.half_flash_image_path, base_dir)
     config.nrfjprog_path = _resolve_tool_or_path_field(config.nrfjprog_path, base_dir)
+    config.jlink_dll_path = _resolve_path_field(config.jlink_dll_path, base_dir)
     config.ota_image_path = _resolve_path_field(config.ota_image_path, base_dir)
     config.records_root = _resolve_path_field(config.records_root, base_dir)
     config.nrf_connect_ble_path = _resolve_path_field(config.nrf_connect_ble_path, base_dir)

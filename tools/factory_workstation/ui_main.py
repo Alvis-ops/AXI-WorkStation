@@ -2378,19 +2378,63 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
         if path:
             self.records_root_var.set(path)
 
+    def _resolve_browse_dir(self, *candidates: str) -> str:
+        for candidate in candidates:
+            text = str(candidate or "").strip()
+            if not text:
+                continue
+            path = Path(text)
+            if path.is_file():
+                return str(path.parent)
+            if path.is_dir():
+                return str(path)
+            parent = path.parent
+            if parent != path and parent.exists() and parent.is_dir():
+                return str(parent)
+        return str(Path.cwd())
+
     def _browse_flash_script(self) -> None:
-        path = filedialog.askopenfilename(filetypes=(("PowerShell", "*.ps1"), ("All files", "*.*")))
+        initialdir = self._resolve_browse_dir(self.flash_script_var.get(), self.firmware_repo_var.get())
+        path = filedialog.askopenfilename(
+            title="选择烧录脚本",
+            initialdir=initialdir,
+            filetypes=(("PowerShell", "*.ps1"), ("All files", "*.*")),
+        )
         if path:
             self.flash_script_var.set(path)
 
     def _browse_flash_image(self) -> None:
-        path = filedialog.askopenfilename(filetypes=(("HEX firmware", "*.hex"), ("All files", "*.*")))
+        initialdir = self._resolve_browse_dir(
+            self.flash_image_var.get(),
+            self.half_flash_image_var.get(),
+            self.firmware_repo_var.get(),
+        )
+        path = filedialog.askopenfilename(
+            title="选择固件 hex 文件",
+            initialdir=initialdir,
+            filetypes=(
+                ("Intel HEX 文件", "*.hex"),
+                ("所有文件", "*.*"),
+            ),
+        )
         if path:
             self.flash_image_var.set(path)
             self._refresh_flash_text()
 
     def _browse_half_flash_image(self) -> None:
-        path = filedialog.askopenfilename(filetypes=(("HEX firmware", "*.hex"), ("All files", "*.*")))
+        initialdir = self._resolve_browse_dir(
+            self.half_flash_image_var.get(),
+            self.flash_image_var.get(),
+            self.firmware_repo_var.get(),
+        )
+        path = filedialog.askopenfilename(
+            title="选择半机烧录固件 hex 文件",
+            initialdir=initialdir,
+            filetypes=(
+                ("Intel HEX 文件", "*.hex"),
+                ("所有文件", "*.*"),
+            ),
+        )
         if path:
             self.half_flash_image_var.set(path)
             self._refresh_flash_text()

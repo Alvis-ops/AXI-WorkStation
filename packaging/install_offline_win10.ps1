@@ -9,19 +9,32 @@ param(
     [switch]$SkipFirmware,
     [switch]$SkipWorkstation,
     [switch]$SkipHashCheck,
+    [switch]$ForceReinstall,
     [switch]$Quiet
 )
 
 $ErrorActionPreference = "Stop"
+$script:AppName = "Axi Factory Workstation"
+$script:ExeName = "Axi Factory Workstation.exe"
+$script:FirmwareLeaf = "axi_p1_factory_merged.hex"
+$script:LogPath = Join-Path ([System.IO.Path]::GetTempPath()) "AxiFactoryWorkstation_offline_install.log"
 
 if (-not $PackageRoot) {
     $PackageRoot = Split-Path -Parent $PSCommandPath
 }
 if (-not $InstallRoot) {
-    $InstallRoot = Join-Path $env:LOCALAPPDATA "Programs\Axi Factory Workstation"
+    $InstallRoot = Join-Path $env:LOCALAPPDATA "Programs\$($script:AppName)"
 }
 
-$script:LogPath = Join-Path ([System.IO.Path]::GetTempPath()) "AxiFactoryWorkstation_offline_install.log"
+$sharedScript = Join-Path $PackageRoot "shared\offline_jlink_env.ps1"
+if (-not (Test-Path -LiteralPath $sharedScript)) {
+    $sharedScript = Join-Path (Split-Path $PSScriptRoot -Parent) "shared\offline_jlink_env.ps1"
+}
+if (-not (Test-Path -LiteralPath $sharedScript)) {
+    throw "Shared offline environment script not found: $sharedScript"
+}
+. $sharedScript
+Initialize-OfflineJLinkEnv -RequiredVersion "7.94e"
 
 function Write-OfflineLog {
     param([string]$Message)
@@ -43,6 +56,10 @@ function Show-OfflineMessage {
 
 function Install-VcRedist {
     param([string]$Path)
+    if (Test-VcRedistInstalled) {
+        Write-OfflineLog "VC++ redistributable already installed; skipping"
+        return $true
+    }
     if (-not (Test-Path -LiteralPath $Path)) {
         Write-OfflineLog "VC++ redistributable not found; skipping: $Path"
         return $false
@@ -85,6 +102,10 @@ function Test-OfflinePackageHashes {
 
 function Install-NrfConnectBlePortable {
     param([string]$SourceDir, [string]$TargetDir)
+    if (Test-NrfConnectBleReady -TargetDir $TargetDir) {
+        Write-OfflineLog "nRF Connect BLE already present; skipping copy: $TargetDir"
+        return $true
+    }
     if (-not (Test-Path -LiteralPath $SourceDir)) { throw "nRF Connect BLE bundle missing: $SourceDir" }
     $exeName = "nRF Connect for Desktop Bluetooth Low Energy.exe"
     if (-not (Test-Path -LiteralPath (Join-Path $SourceDir $exeName))) { throw "Invalid nRF Connect BLE bundle; missing $exeName" }
@@ -95,61 +116,12 @@ function Install-NrfConnectBlePortable {
     return $true
 }
 
-function Install-ExeDependency {
-    param(
-        [string]$Name,
-        [string]$Path,
-        [string[]]$Arguments
-    )
-    if (-not (Test-Path -LiteralPath $Path)) {
-        throw "$Name installer missing: $Path"
-    }
-    Write-OfflineLog "Installing ${Name}: $Path $($Arguments -join ' ')"
-    $proc = Start-Process -FilePath $Path -ArgumentList $Arguments -Wait -PassThru
-    Write-OfflineLog ("{0} installer exit code: {1}" -f $Name, $proc.ExitCode)
-    if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010 -and $proc.ExitCode -ne 1638) {
-        throw "$Name installer failed with exit code $($proc.ExitCode)"
-    }
-    return $true
-}
-
-function Find-Nrfjprog {
-    $candidates = @()
-    if (${env:ProgramFiles}) {
-        $candidates += (Join-Path ${env:ProgramFiles} "Nordic Semiconductor\nrf-command-line-tools\bin\nrfjprog.exe")
-    }
-    if (${env:ProgramFiles(x86)}) {
-        $candidates += (Join-Path ${env:ProgramFiles(x86)} "Nordic Semiconductor\nrf-command-line-tools\bin\nrfjprog.exe")
-    }
-    foreach ($candidate in $candidates) {
-        if ($candidate -and (Test-Path -LiteralPath $candidate)) { return $candidate }
-    }
-    $cmd = Get-Command nrfjprog -ErrorAction SilentlyContinue
-    if ($cmd) { return $cmd.Source }
-    return ""
-}
-
-function Find-JLinkTool {
-    $candidates = @()
-    if (${env:ProgramFiles}) {
-        $candidates += (Join-Path ${env:ProgramFiles} "SEGGER\JLink\JLink.exe")
-        $candidates += (Join-Path ${env:ProgramFiles} "SEGGER\JLink\JLinkExe.exe")
-    }
-    if (${env:ProgramFiles(x86)}) {
-        $candidates += (Join-Path ${env:ProgramFiles(x86)} "SEGGER\JLink\JLink.exe")
-        $candidates += (Join-Path ${env:ProgramFiles(x86)} "SEGGER\JLink\JLinkExe.exe")
-    }
-    foreach ($candidate in $candidates) {
-        if ($candidate -and (Test-Path -LiteralPath $candidate)) { return $candidate }
-    }
-    return ""
-}
-
 function Set-WorkstationDefaultFirmware {
     param(
         [string]$InstallRoot,
         [string]$FirmwareSource,
         [string]$NrfjprogPath,
+        [string]$JLinkDllPath,
         [string]$NrfConnectBlePath
     )
     if (-not (Test-Path -LiteralPath $FirmwareSource)) {
@@ -157,45 +129,35 @@ function Set-WorkstationDefaultFirmware {
     }
     $firmwareTargetDir = Join-Path $InstallRoot "firmware"
     New-Item -ItemType Directory -Path $firmwareTargetDir -Force | Out-Null
-    $firmwareTarget = Join-Path $firmwareTargetDir "axi_p1_factory_merged.hex"
+    $firmwareTarget = Join-Path $firmwareTargetDir $script:FirmwareLeaf
     Copy-Item -LiteralPath $FirmwareSource -Destination $firmwareTarget -Force
 
     $configPath = Join-Path $InstallRoot "config.json"
-    if (-not (Test-Path -LiteralPath $configPath)) {
-        throw "Workstation config not found: $configPath"
+    Update-WorkstationFlashConfig -ConfigPath $configPath -PreserveExistingUserSettings -Values @{
+        half_flash_before_test = $false
+        flash_backend = "nrfjprog"
+        flash_image_path = "firmware\$($script:FirmwareLeaf)"
+        half_flash_image_path = "firmware\$($script:FirmwareLeaf)"
+        flash_after_wait_s = 8.0
+        flash_timeout_s = 180.0
+        flash_verify = $true
+        nrfjprog_path = $(if ($NrfjprogPath) { $NrfjprogPath } else { "nrfjprog" })
+        jlink_dll_path = $JLinkDllPath
+        record_output_mode = "unified"
+        nrf_connect_ble_path = $NrfConnectBlePath
     }
-    $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
-    $config | Add-Member -NotePropertyName "half_flash_before_test" -NotePropertyValue $false -Force
-    $config | Add-Member -NotePropertyName "flash_backend" -NotePropertyValue "nrfjprog" -Force
-    $config | Add-Member -NotePropertyName "flash_image_path" -NotePropertyValue "firmware\axi_p1_factory_merged.hex" -Force
-    $config | Add-Member -NotePropertyName "half_flash_image_path" -NotePropertyValue "firmware\axi_p1_factory_merged.hex" -Force
-    $config | Add-Member -NotePropertyName "flash_after_wait_s" -NotePropertyValue 8.0 -Force
-    $config | Add-Member -NotePropertyName "flash_timeout_s" -NotePropertyValue 180.0 -Force
-    $config | Add-Member -NotePropertyName "flash_verify" -NotePropertyValue $true -Force
-    $config | Add-Member -NotePropertyName "nrfjprog_path" -NotePropertyValue $(if ($NrfjprogPath) { $NrfjprogPath } else { "nrfjprog" }) -Force
-    $config | Add-Member -NotePropertyName "record_output_mode" -NotePropertyValue "unified" -Force
-    $config | Add-Member -NotePropertyName "nrf_connect_ble_path" -NotePropertyValue $NrfConnectBlePath -Force
-    $config | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $configPath -Encoding UTF8
-    Write-OfflineLog "Configured default firmware: $firmwareTarget"
+    Write-OfflineLog "Configured default firmware and flash settings: $firmwareTarget"
 }
 
 function Test-InstalledTools {
     param(
         [string]$InstallRoot,
         [string]$NrfConnectBlePath,
-        [string]$FirmwarePath
+        [string]$FirmwarePath,
+        [string]$NrfjprogPath,
+        [string]$JLinkDllPath
     )
-    $nrfjprog = Find-Nrfjprog
-    if (-not $nrfjprog) { throw "nrfjprog.exe not found after Nordic Command Line Tools install" }
-    Write-OfflineLog "nrfjprog found: $nrfjprog"
-    $version = & $nrfjprog --version 2>&1
-    Write-OfflineLog "nrfjprog --version: $version"
-    $ids = & $nrfjprog --ids 2>&1
-    Write-OfflineLog "nrfjprog --ids: $ids"
-
-    $jlink = Find-JLinkTool
-    if (-not $jlink) { throw "SEGGER J-Link tool not found after install" }
-    Write-OfflineLog "J-Link tool found: $jlink"
+    Test-FlashEnvironmentReady -NrfjprogPath $NrfjprogPath -JLinkDllPath $JLinkDllPath -LogCallback ${function:Write-OfflineLog}
 
     $bleExe = Join-Path $NrfConnectBlePath "nRF Connect for Desktop Bluetooth Low Energy.exe"
     if (-not (Test-Path -LiteralPath $bleExe)) { throw "nRF Connect BLE backend missing: $bleExe" }
@@ -204,7 +166,7 @@ function Test-InstalledTools {
     if (-not (Test-Path -LiteralPath $FirmwarePath)) { throw "Default firmware hex missing after install: $FirmwarePath" }
     Write-OfflineLog "Default firmware found: $FirmwarePath"
 
-    $exePath = Join-Path $InstallRoot "Axi Factory Workstation.exe"
+    $exePath = Join-Path $InstallRoot $script:ExeName
     if (-not (Test-Path -LiteralPath $exePath)) { throw "Workstation exe missing after install: $exePath" }
     Write-OfflineLog "Workstation exe found: $exePath"
 }
@@ -217,60 +179,101 @@ function Find-SetupExe {
 }
 
 try {
-    Write-OfflineLog "Offline install started. PackageRoot=$PackageRoot"
+    if (Test-Path -LiteralPath $script:LogPath) {
+        Remove-Item -LiteralPath $script:LogPath -Force
+    }
+    Write-OfflineLog "Offline install started. PackageRoot=$PackageRoot InstallRoot=$InstallRoot"
     if (-not $SkipHashCheck) {
         Test-OfflinePackageHashes -Root $PackageRoot
     }
     $depsDir = Join-Path $PackageRoot "deps"
     $appDir = Join-Path $PackageRoot "app"
+    $targetBle = Join-Path $env:LOCALAPPDATA "Programs\nrfconnect-bluetooth-low-energy"
+    $configPath = Join-Path $InstallRoot "config.json"
+    $preferredJLinkDll = Get-ConfigJLinkDllPath -ConfigPath $configPath
+
     if (-not $SkipVcRedist) {
         if (-not (Install-VcRedist -Path (Join-Path $depsDir "vc_redist.x64.exe"))) {
             throw "VC++ redistributable installation failed"
         }
     }
-    $targetBle = Join-Path $env:LOCALAPPDATA "Programs\nrfconnect-bluetooth-low-energy"
     if (-not $SkipNrfConnect) {
         Install-NrfConnectBlePortable -SourceDir (Join-Path $depsDir "nrfconnect-bluetooth-low-energy") -TargetDir $targetBle | Out-Null
         Write-OfflineLog "nRF Connect BLE ready at $targetBle"
     }
-    if (-not $SkipJLink) {
-        $jlinkInstaller = Join-Path $depsDir "segger-jlink-installer.exe"
-        if (Test-Path -LiteralPath $jlinkInstaller) {
-            Install-ExeDependency -Name "SEGGER J-Link" -Path $jlinkInstaller -Arguments @("/S") | Out-Null
-        } else {
-            Write-OfflineLog "Standalone SEGGER J-Link installer not bundled; Nordic Command Line Tools installer is expected to provide the required J-Link runtime."
-        }
+
+    $jlinkInstallation = $null
+    if (-not $SkipJLink -and -not $SkipNordicCli) {
+        $nordicInstaller = Join-Path $depsDir "nordic-command-line-tools-installer.exe"
+        $jlinkInstallation = Ensure-JLinkStack `
+            -NordicInstallerPath $nordicInstaller `
+            -PreferredJLinkDllPath $preferredJLinkDll `
+            -LogCallback ${function:Write-OfflineLog}
     }
-    if (-not $SkipNordicCli) {
-        Install-ExeDependency -Name "Nordic Command Line Tools" -Path (Join-Path $depsDir "nordic-command-line-tools-installer.exe") -Arguments @("/S") | Out-Null
-    }
+
+    $nrfjprogPath = Find-Nrfjprog
     if (-not $SkipWorkstation) {
-        $setupExe = Find-SetupExe -AppDir $appDir
-        Write-OfflineLog "Launching workstation setup: $setupExe"
-        if ($InstallRoot) {
-            $env:AXI_FACTORY_INSTALL_DIR = $InstallRoot
-            $env:AXI_FACTORY_INSTALL_ROOT = $InstallRoot
+        $exePath = Join-Path $InstallRoot $script:ExeName
+        if ((Test-Path -LiteralPath $exePath) -and -not $ForceReinstall) {
+            Write-OfflineLog "Workstation already installed; skipping setup exe: $exePath"
+        } else {
+            $setupExe = Find-SetupExe -AppDir $appDir
+            Write-OfflineLog "Launching workstation setup: $setupExe"
+            if ($InstallRoot) {
+                $env:AXI_FACTORY_INSTALL_DIR = $InstallRoot
+                $env:AXI_FACTORY_INSTALL_ROOT = $InstallRoot
+            }
+            $proc = Start-Process -FilePath $setupExe -Wait -PassThru
+            Write-OfflineLog ("Workstation setup exit code: {0}" -f $proc.ExitCode)
+            if ($proc.ExitCode -ne 0) { throw "Workstation setup failed with exit code $($proc.ExitCode)" }
         }
-        $proc = Start-Process -FilePath $setupExe -Wait -PassThru
-        Write-OfflineLog ("Workstation setup exit code: {0}" -f $proc.ExitCode)
-        if ($proc.ExitCode -ne 0) { throw "Workstation setup failed with exit code $($proc.ExitCode)" }
     }
-    $installedFirmware = Join-Path $InstallRoot "firmware\axi_p1_factory_merged.hex"
+
+    $installedFirmware = Join-Path $InstallRoot ("firmware\{0}" -f $script:FirmwareLeaf)
     if (-not $SkipFirmware) {
         Set-WorkstationDefaultFirmware `
             -InstallRoot $InstallRoot `
-            -FirmwareSource (Join-Path $PackageRoot "firmware\axi_p1_factory_merged.hex") `
-            -NrfjprogPath (Find-Nrfjprog) `
+            -FirmwareSource (Join-Path $PackageRoot ("firmware\{0}" -f $script:FirmwareLeaf)) `
+            -NrfjprogPath $nrfjprogPath `
+            -JLinkDllPath $(if ($jlinkInstallation) { $jlinkInstallation.DllPath } else { $preferredJLinkDll }) `
             -NrfConnectBlePath $targetBle
     }
-    if (-not $SkipWorkstation -and -not $SkipNrfConnect -and -not $SkipNordicCli -and -not $SkipFirmware) {
-        Test-InstalledTools -InstallRoot $InstallRoot -NrfConnectBlePath $targetBle -FirmwarePath $installedFirmware
+
+    if (-not $SkipWorkstation -and -not $SkipJLink -and -not $SkipNordicCli -and -not $SkipFirmware) {
+        $finalJLinkDll = if ($jlinkInstallation) { $jlinkInstallation.DllPath } else { Get-ConfigJLinkDllPath -ConfigPath $configPath }
+        Test-InstalledTools `
+            -InstallRoot $InstallRoot `
+            -NrfConnectBlePath $targetBle `
+            -FirmwarePath $installedFirmware `
+            -NrfjprogPath $nrfjprogPath `
+            -JLinkDllPath $finalJLinkDll
     }
-    Show-OfflineMessage -Title "Axi Factory Workstation Offline Setup" -Message ("Offline dependency install completed.`n`nLog:`n{0}" -f $script:LogPath)
+
+    New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
+    $installNote = Join-Path $InstallRoot "INSTALL_README.txt"
+    @(
+        "$($script:AppName) offline install completed.",
+        "",
+        "Install folder:",
+        $InstallRoot,
+        "",
+        "Next steps:",
+        "1. Connect J-Link USB and factory dongle/UART as needed.",
+        "2. Verify probe with the workstation's 烧录检测 button.",
+        "3. Configure engineering credentials and COM ports in the GUI.",
+        "4. The workstation is pinned to Nordic-compatible J-Link 7.94e via nrfjprog --jdll.",
+        "5. If another workstation already installed the flash environment, dependency install was skipped automatically.",
+        "",
+        "Install log:",
+        $script:LogPath
+    ) | Set-Content -LiteralPath $installNote -Encoding UTF8
+    Write-OfflineLog "Wrote install note: $installNote"
+
+    Show-OfflineMessage -Title "$($script:AppName) Offline Setup" -Message ("Offline install completed.`n`nInstall path:`n{0}`n`nLog:`n{1}" -f $InstallRoot, $script:LogPath)
     Write-OfflineLog "Offline install completed"
 } catch {
     $message = $_.Exception.Message
     Write-OfflineLog "ERROR: $message"
-    Show-OfflineMessage -Title "Axi Factory Workstation Offline Setup Failed" -Message ("Offline install failed.`n`nError:`n{0}`n`nLog:`n{1}" -f $message, $script:LogPath)
+    Show-OfflineMessage -Title "$($script:AppName) Offline Setup Failed" -Message ("Offline install failed.`n`nError:`n{0}`n`nLog:`n{1}" -f $message, $script:LogPath)
     exit 1
 }

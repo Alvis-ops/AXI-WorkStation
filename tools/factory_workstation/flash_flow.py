@@ -8,7 +8,7 @@ from typing import Callable
 
 from .at_client import ATClient, CommandResult
 from .config import WorkstationConfig
-from .flash_runner import FlashOutcome
+from .flash_runner import CREATE_NO_WINDOW, JLINK_ERROR_256, FlashOutcome
 
 
 FlashRunner = Callable[[WorkstationConfig, Callable[[str, str], None] | None], FlashOutcome]
@@ -29,6 +29,7 @@ def flash_payload(config: WorkstationConfig, outcome: FlashOutcome | None = None
         "flash_backend": config.flash_backend,
         "flash_image_path": config.flash_image_path,
         "jlink_probe_id": config.jlink_probe_id,
+        "jlink_dll_path": config.jlink_dll_path,
     }
     if outcome is not None:
         payload.update(
@@ -47,9 +48,19 @@ def _parse_probe_ids(output: str) -> list[str]:
     probe_ids: list[str] = []
     for raw in output.splitlines():
         line = raw.strip()
-        if line and any(ch.isdigit() for ch in line):
+        if line.isdigit() and 6 <= len(line) <= 16:
             probe_ids.append(line)
     return probe_ids
+
+
+def _jlink_dll_args(config: WorkstationConfig) -> list[str]:
+    dll_path = str(config.jlink_dll_path or "").strip()
+    if not dll_path:
+        return []
+    path = Path(dll_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"J-Link DLL not found: {path}")
+    return ["--jdll", str(path)]
 
 
 def precheck_flash_request(config: WorkstationConfig, *, sn_enabled: bool, dry_run: bool = False) -> FlashPrecheckResult:
@@ -85,26 +96,52 @@ def precheck_flash_request(config: WorkstationConfig, *, sn_enabled: bool, dry_r
 
     tool = str(config.nrfjprog_path or "nrfjprog").strip() or "nrfjprog"
     try:
-        proc = subprocess.run(
-            [tool, "--ids"],
+        jlink_args = _jlink_dll_args(config)
+    except (FileNotFoundError, ValueError) as exc:
+        return FlashPrecheckResult(False, "ERR", str(exc))
+
+    try:
+        version_proc = subprocess.run(
+            [tool, "--version", *jlink_args],
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             timeout=15.0,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        ids_proc = subprocess.run(
+            [tool, "--ids", *jlink_args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15.0,
+            creationflags=CREATE_NO_WINDOW,
         )
     except FileNotFoundError:
         return FlashPrecheckResult(False, "ERR", f"nrfjprog not found: {tool}")
     except subprocess.TimeoutExpired:
-        return FlashPrecheckResult(False, "ERR", "nrfjprog --ids timeout")
+        return FlashPrecheckResult(False, "ERR", "nrfjprog probe check timeout")
     except Exception as exc:
-        return FlashPrecheckResult(False, "ERR", f"nrfjprog --ids failed: {exc}")
+        return FlashPrecheckResult(False, "ERR", f"nrfjprog probe check failed: {exc}")
 
-    output = "\n".join(part for part in (proc.stdout, proc.stderr) if part)
-    if proc.returncode != 0:
-        return FlashPrecheckResult(False, "ERR", f"nrfjprog --ids exit={proc.returncode}: {output.strip()}")
+    version_output = "\n".join(part for part in (version_proc.stdout, version_proc.stderr) if part).strip()
+    ids_output = "\n".join(part for part in (ids_proc.stdout, ids_proc.stderr) if part).strip()
+    raw_output = "\n".join(part for part in (version_output, ids_output) if part)
 
-    probe_ids = _parse_probe_ids(output)
+    if version_proc.returncode != 0 or JLINK_ERROR_256 in raw_output:
+        dll_hint = str(config.jlink_dll_path or "自动选择的 J-Link DLL")
+        return FlashPrecheckResult(
+            False,
+            "ERR",
+            f"J-Link DLL 与 nrfjprog 不兼容: {dll_hint}。请重新运行离线安装包",
+        )
+
+    if ids_proc.returncode != 0:
+        return FlashPrecheckResult(False, "ERR", f"nrfjprog --ids exit={ids_proc.returncode}: {ids_output.strip()}")
+
+    probe_ids = _parse_probe_ids(ids_output)
     if len(probe_ids) > 1:
         message = "multiple J-Link probes detected; configure jlink_probe_id"
         if sn_enabled and not dry_run:

@@ -13,6 +13,9 @@ from .config import BareBoardConfig
 
 FlashLogCallback = Callable[[str, str], None]
 JLINK_ERROR_256 = "JLinkARM.dll reported error -256"
+# nrfjprog --family accepts Nordic CLI names (NRF51/52/53/54L/91, AUTO, UNKNOWN).
+# NRF54L15_XXAA is a Zephyr/soc label and must not be passed to nrfjprog.
+DEFAULT_NRFJPROG_FAMILY = ""
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
@@ -105,10 +108,10 @@ def _jlink_dll_args(config: BareBoardConfig, *, require_file: bool = True) -> li
     return ["--jdll", dll_path]
 
 
-def build_flash_command(config: BareBoardConfig) -> FlashCommand:
+def build_flash_command(config: BareBoardConfig, *, probe_id_override: str = "") -> FlashCommand:
     backend = str(config.flash_backend or "nrfjprog").strip().lower()
     env = os.environ.copy()
-    probe_id = str(config.jlink_probe_id or "").strip()
+    probe_id = str(probe_id_override or config.jlink_probe_id or "").strip()
     repo = str(config.firmware_repo or "").strip()
     cwd = repo if repo and Path(repo).exists() else str(Path.cwd())
 
@@ -116,7 +119,7 @@ def build_flash_command(config: BareBoardConfig) -> FlashCommand:
         image = _require_file(config.flash_image_path, "flash image")
         tool = str(config.nrfjprog_path or "nrfjprog").strip() or "nrfjprog"
         argv = [tool, "--program", str(image), "--chiperase", *_jlink_dll_args(config)]
-        family = str(config.nrfjprog_family or "").strip()
+        family = str(config.nrfjprog_family or DEFAULT_NRFJPROG_FAMILY).strip()
         if family:
             argv.extend(["--family", family])
         if config.flash_verify:
@@ -145,7 +148,7 @@ def build_flash_command(config: BareBoardConfig) -> FlashCommand:
             env["BARE_BOARD_FLASH_IMAGE"] = image_path
         if probe_id:
             env["BARE_BOARD_JLINK_ID"] = probe_id
-        family = str(config.nrfjprog_family or "").strip()
+        family = str(config.nrfjprog_family or DEFAULT_NRFJPROG_FAMILY).strip()
         if family:
             env["BARE_BOARD_NRFJPROG_FAMILY"] = family
         argv = [
@@ -346,7 +349,11 @@ def run_flash(config: BareBoardConfig, line_callback: FlashLogCallback | None = 
         if line_callback is not None and probe_ids:
             line_callback("FLASH", f"J-Link probe detected: {', '.join(probe_ids)}")
 
-        command = build_flash_command(config)
+        probe_id_override = ""
+        if not str(config.jlink_probe_id or "").strip() and len(probe_ids) == 1:
+            probe_id_override = probe_ids[0]
+
+        command = build_flash_command(config, probe_id_override=probe_id_override)
         if line_callback is not None:
             line_callback("FLASH", command.display)
         proc = subprocess.Popen(
@@ -392,7 +399,16 @@ def run_flash(config: BareBoardConfig, line_callback: FlashLogCallback | None = 
         elapsed_ms = int((time.monotonic() - started) * 1000)
         if exit_code == 0:
             return FlashOutcome(True, "PASS", "flash completed", elapsed_ms, exit_code, command)
-        return FlashOutcome(False, "NG", f"flash command failed with exit code {exit_code}", elapsed_ms, exit_code, command)
+        hint = ""
+        combined = output or ""
+        if exit_code == 33 or "error -102" in combined.lower() or "unable to connect to a debugger" in combined.lower():
+            family = str(config.nrfjprog_family or "").strip() or "AUTO"
+            hint = (
+                f" 提示: 检查 SWD 接线/板子上电；nrfjprog family 留空(AUTO)或填 NRF54L，"
+                "不要用 Zephyr 名 NRF54L15_XXAA"
+            )
+        message = f"flash command failed with exit code {exit_code}{hint}"
+        return FlashOutcome(False, "NG", message, elapsed_ms, exit_code, command)
     except Exception as exc:
         elapsed_ms = int((time.monotonic() - started) * 1000)
         if line_callback is not None:

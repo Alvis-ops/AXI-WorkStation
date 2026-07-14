@@ -5,7 +5,7 @@ param(
     [string]$NordicCliInstallerPath = "",
     [string]$FirmwareHexPath = "",
     [string]$OutputDir = "",
-    [string]$PackageRevision = "r13",
+    [string]$PackageRevision = "r16",
     [switch]$DownloadVcRedist,
     [switch]$SkipNordicCli,
     [switch]$SkipFirmware,
@@ -346,6 +346,9 @@ if (-not $SkipFirmware) {
 
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "install_offline_win10.ps1") -Destination (Join-Path $OutputDir "install_offline_win10.ps1") -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "install_offline_win10.cmd") -Destination (Join-Path $OutputDir "install_offline_win10.cmd") -Force
+$sharedOutputDir = Join-Path $OutputDir "shared"
+New-Item -ItemType Directory -Path $sharedOutputDir -Force | Out-Null
+Copy-Item -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) "shared\offline_jlink_env.ps1") -Destination (Join-Path $sharedOutputDir "offline_jlink_env.ps1") -Force
 
 $missingDeps = @()
 if (-not (Test-Path -LiteralPath $vcRedistDest)) { $missingDeps += "deps/vc_redist.x64.exe" }
@@ -373,6 +376,8 @@ $manifest = [ordered]@{
     jlink_r12_v956_remediation = "uninstall canonical SEGGER JLink path when DLL version is 9.56"
     jlink_dll_selection = "explicit nrfjprog --jdll path"
     jlink_driver_registration = "InstDrivers.exe /silent with optional pnputil INF fallback"
+    shared_install_helpers = "shared/offline_jlink_env.ps1"
+    environment_reuse = "skip VC++/Nordic/J-Link when compatible 7.94e stack already exists"
     nordic_command_line_tools_installer = "deps/nordic-command-line-tools-installer.exe"
     nordic_install_skip_bundled_segger = $false
     default_firmware_hex = "firmware/$firmwareLeaf"
@@ -390,12 +395,13 @@ Write-Utf8NoBom -Path (Join-Path $OutputDir "INSTALL_FIRST.txt") -Lines @(
     "1. Copy this ENTIRE folder to the target PC (do not copy only the app subfolder).",
     "2. Right-click install_offline_win10.cmd and choose Run as administrator.",
     "3. Do NOT only run app\Axi_Bare_Board_Workstation_Setup_*.exe; that skips nrfjprog, VC++, J-Link USB driver, and firmware setup.",
-    "4. The installer removes the incompatible canonical J-Link 9.56 left by r12, then Nordic installs validated J-Link 7.94e.",
-    "5. The installer runs USBDriver\InstDrivers.exe /silent; loose INF files are registered with pnputil when available.",
-    "6. After install, connect/replug J-Link USB and verify using the workstation's detector.",
-    "7. Open the workstation and set the correct COM port (115200).",
-    "8. nrfjprog flash warnings about --verify are normal when verify is disabled.",
-    "9. If flash says 'No debuggers were discovered', check Device Manager for VID_1366 / PID_0105 and rerun install_offline_win10.cmd as administrator."
+    "4. The installer removes incompatible canonical J-Link 9.56, then reuses or installs validated J-Link 7.94e.",
+    "5. If another workstation already installed nrfjprog + J-Link 7.94e, dependency install is skipped automatically.",
+    "6. The installer runs USBDriver\InstDrivers.exe /silent; loose INF files are registered with pnputil when available.",
+    "7. After install, connect/replug J-Link USB and verify using the workstation's detector.",
+    "8. Open the workstation and set the correct COM port (115200).",
+    "9. nrfjprog flash warnings about --verify are normal when verify is disabled.",
+    "10. If flash says 'No debuggers were discovered', check Device Manager for VID_1366 / PID_0105 and rerun install_offline_win10.cmd as administrator."
 )
 
 $missingText = if ($missingDeps.Count -gt 0) { ($missingDeps | ForEach-Object { "- $_" }) -join "`n" } else { "- none" }

@@ -20,6 +20,7 @@ $content = @"
   "flash_timeout_s": 180.0,
   "flash_verify": true,
   "nrfjprog_path": "nrfjprog",
+  "jlink_dll_path": "",
   "jlink_probe_id": "",
   "uart_port": "COM18",
   "uart_baudrate": 460800,

@@ -34,7 +34,7 @@ Copy-Item tools\bare_board_workstation\config.json.example tools\bare_board_work
 
 - `flash_image_path`：裸板测试固件镜像，默认用于 `nrfjprog --program`。
 - `jlink_dll_path`：固定传给 `nrfjprog --jdll` 的 JLinkARM DLL；离线安装包会自动写入兼容版本。
-- `nrfjprog_family`：传给 `nrfjprog --family`。
+- `nrfjprog_family`：传给 `nrfjprog --family`。POC3A（nRF54L15）建议留空，由 nrfjprog 自动识别（`AUTO`）；也可显式填 `NRF54L`。不要用 Zephyr 芯片名 `NRF54L15_XXAA`。
 - `jlink_probe_id`：多 Probe 环境下的 J-Link 序列号。
 - `serial_port` / `serial_baudrate`：测试固件日志串口。
 - `test_start_command`：打开串口后需要主动发送的启动命令；为空时只监听固件输出。

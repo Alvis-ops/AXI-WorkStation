@@ -9,11 +9,11 @@ This folder is a complete offline delivery package for factory PCs that cannot d
 | Path | Purpose |
 |------|---------|
 | install_offline_win10.cmd | One-click offline install entry (recommended) |
+| shared/offline_jlink_env.ps1 | Shared flash-environment detection and J-Link 7.94e pinning helpers |
 | app/{{SETUP_EXE}} | Workstation setup installer |
 | deps/nrfconnect-bluetooth-low-energy/ | Portable nRF Connect BLE runtime for DONGLE backend |
 | deps/vc_redist.x64.exe | Microsoft VC++ 2015-2022 x64 redistributable |
-| deps/nordic-command-line-tools-installer.exe | Nordic Command Line Tools installer (`nrfjprog`) |
-| deps/segger-jlink-installer.exe | Optional standalone SEGGER J-Link installer, only present when explicitly bundled |
+| deps/nordic-command-line-tools-installer.exe | Nordic Command Line Tools (`nrfjprog`) and validated J-Link 7.94e |
 | firmware/axi_p1_factory_merged.hex | Default single firmware image for factory flashing |
 | SHA256SUMS.txt | Integrity checksums |
 | MANIFEST.json | Build metadata |
@@ -31,13 +31,14 @@ install_offline_win10.cmd
 The script will:
 
 1. Verify package SHA256 checksums.
-2. Install VC++ x64 redistributable silently, or accept an existing installation.
-3. Copy nRF Connect BLE into `%LOCALAPPDATA%\Programs\nrfconnect-bluetooth-low-energy`.
-4. Install standalone SEGGER J-Link if bundled.
-5. Install Nordic Command Line Tools. This is the primary flashing dependency and is expected to provide `nrfjprog` plus the required J-Link runtime.
-6. Launch the workstation setup installer.
-7. Copy the default firmware hex into the workstation install folder and update `config.json`.
-8. Run install self-checks: `nrfjprog --version`, `nrfjprog --ids`, J-Link tool path, BLE backend path, and default firmware path.
+2. Install VC++ x64 redistributable silently, or skip if already installed.
+3. Copy nRF Connect BLE into `%LOCALAPPDATA%\Programs\nrfconnect-bluetooth-low-energy`, or skip if already present.
+4. Remove incompatible canonical J-Link 9.56 if present.
+5. Reuse an existing compatible `nrfjprog + J-Link 7.94e` environment when detected; otherwise install Nordic Command Line Tools with bundled SEGGER.
+6. Pin `jlink_dll_path` in workstation `config.json` and pass `nrfjprog --jdll` for flashing.
+7. Launch the workstation setup installer, or skip if already installed unless `-ForceReinstall` is used.
+8. Copy the default firmware hex into the workstation install folder and update flash settings.
+9. Run install self-checks using the pinned DLL: `nrfjprog --version --jdll`, optional `nrfjprog --ids --jdll`, BLE backend path, and firmware path.
 
 Optional custom install path:
 
@@ -53,6 +54,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install_offline_win10.ps1 
 - Default UART: `COM18 @ 460800`; change it per machine if needed.
 - Default flash backend: `nrfjprog`.
 - Default flash image: `firmware\axi_p1_factory_merged.hex` under the workstation install folder.
+- If a bare-board workstation or another factory install already configured the flash environment, the second install reuses it instead of reinstalling Nordic/J-Link.
 - The installer writes the install path to the completion dialog and to a desktop text note when possible.
 
 ## Verify Checksums Manually

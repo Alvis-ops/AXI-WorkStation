@@ -7,7 +7,7 @@ param(
     [string]$NordicCliInstallerPath = "",
     [string]$FirmwareHexPath = "",
     [string]$OutputDir = "",
-    [string]$PackageRevision = "r7",
+    [string]$PackageRevision = "r8",
     [switch]$DownloadVcRedist,
     [switch]$SkipNrfConnect,
     [switch]$SkipJLink,
@@ -327,14 +327,8 @@ if ($DownloadVcRedist) {
 }
 
 $jlinkInstallerDest = Join-Path $depsDir "segger-jlink-installer.exe"
-if (-not $SkipJLink) {
-    $localJLinkInstaller = Find-LocalJLinkInstaller
-    if ($localJLinkInstaller) {
-        Write-Host "Copying SEGGER J-Link installer: $localJLinkInstaller"
-        Copy-Item -LiteralPath $localJLinkInstaller -Destination $jlinkInstallerDest -Force
-    } else {
-        Write-Warning "SEGGER J-Link installer not found."
-    }
+if (Test-Path -LiteralPath $jlinkInstallerDest) {
+    Remove-Item -LiteralPath $jlinkInstallerDest -Force
 }
 
 $nordicCliInstallerDest = Join-Path $depsDir "nordic-command-line-tools-installer.exe"
@@ -361,14 +355,14 @@ if (-not $SkipFirmware) {
 
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "install_offline_win10.ps1") -Destination (Join-Path $OutputDir "install_offline_win10.ps1") -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "install_offline_win10.cmd") -Destination (Join-Path $OutputDir "install_offline_win10.cmd") -Force
+$sharedOutputDir = Join-Path $OutputDir "shared"
+New-Item -ItemType Directory -Path $sharedOutputDir -Force | Out-Null
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot "shared\offline_jlink_env.ps1") -Destination (Join-Path $sharedOutputDir "offline_jlink_env.ps1") -Force
 
 $missingDeps = @()
 if (-not $nrfCopied) { $missingDeps += "deps/nrfconnect-bluetooth-low-energy/" }
 if (-not (Test-Path -LiteralPath $vcRedistDest)) { $missingDeps += "deps/vc_redist.x64.exe" }
 if (-not (Test-Path -LiteralPath $nordicCliInstallerDest)) { $missingDeps += "deps/nordic-command-line-tools-installer.exe" }
-if (-not (Test-Path -LiteralPath $jlinkInstallerDest) -and -not (Test-Path -LiteralPath $nordicCliInstallerDest)) {
-    $missingDeps += "deps/segger-jlink-installer.exe or deps/nordic-command-line-tools-installer.exe"
-}
 if (-not (Test-Path -LiteralPath $firmwareHexDest)) { $missingDeps += "firmware/axi_p1_factory_merged.hex" }
 
 Write-Utf8NoBom -Path (Join-Path $depsDir "README_DEPS.txt") -Lines @(
@@ -376,12 +370,9 @@ Write-Utf8NoBom -Path (Join-Path $depsDir "README_DEPS.txt") -Lines @(
     "For rebuilds, provide nRF Connect BLE from %LOCALAPPDATA%\Programs\nrfconnect-bluetooth-low-energy.",
     "For rebuilds, provide Microsoft VC++ 2015-2022 x64 redistributable as deps\vc_redist.x64.exe.",
     "For rebuilds, provide Nordic Command Line Tools installer as deps\nordic-command-line-tools-installer.exe.",
-    "A standalone SEGGER J-Link installer is optional when the Nordic installer is bundled; the install self-check still verifies J-Link after install.",
+    "Nordic CLI provides nrfjprog and its validated J-Link 7.94e package; do not bundle standalone J-Link V9.56.",
     "For rebuilds, provide the factory merged.hex as firmware\axi_p1_factory_merged.hex."
 )
-
-$jlinkInstallerManifest = if (Test-Path -LiteralPath $jlinkInstallerDest) { "deps/segger-jlink-installer.exe" } else { "not bundled" }
-$jlinkSourceManifest = if (Test-Path -LiteralPath $jlinkInstallerDest) { "standalone_installer" } elseif (Test-Path -LiteralPath $nordicCliInstallerDest) { "nordic_command_line_tools_installer" } else { "missing" }
 
 $manifest = [ordered]@{
     package_type = "win10_x64_offline_usb"
@@ -391,10 +382,15 @@ $manifest = [ordered]@{
     payload_zip = "app/Axi_Factory_Workstation_payload.zip"
     payload_layout = "root"
     nrf_connect_version = $nrfVersion
-    jlink_installer = $jlinkInstallerManifest
-    jlink_source = $jlinkSourceManifest
-    jlink_standalone_installer_optional = $true
+    jlink_source = "bundled_with_nordic_command_line_tools"
+    jlink_required_version = "7.94e"
+    jlink_r12_v956_remediation = "uninstall canonical SEGGER JLink path when DLL version is 9.56"
+    jlink_dll_selection = "explicit nrfjprog --jdll path"
+    jlink_driver_registration = "InstDrivers.exe /silent with optional pnputil INF fallback"
+    shared_install_helpers = "shared/offline_jlink_env.ps1"
+    environment_reuse = "skip VC++/Nordic/J-Link/BLE when compatible stack already exists"
     nordic_command_line_tools_installer = "deps/nordic-command-line-tools-installer.exe"
+    nordic_install_skip_bundled_segger = $false
     default_firmware_hex = "firmware/axi_p1_factory_merged.hex"
     missing_deps = $missingDeps
     complete_offline = ($missingDeps.Count -eq 0)
