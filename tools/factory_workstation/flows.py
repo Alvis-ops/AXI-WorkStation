@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Union
 
-from .at_parser import is_capture_frame_line
+from .at_parser import is_capture_frame_line, parse_line
 from .at_client import ATClient, CommandResult
 from .config import WorkstationConfig, redact_sensitive_text
 from .storage import NullRunRecord, RunRecord
@@ -22,6 +22,7 @@ class FlowStep:
     command: str
     timeout_s: float | None = None
     required: bool = True
+    validator: Callable[[CommandResult], tuple[bool, str]] | None = None
 
 
 @dataclass
@@ -81,16 +82,20 @@ def _run_steps(
         result = client.send_command(step.command, timeout)
         elapsed_ms = int((time.monotonic() - t0) * 1000)
         results.append(result)
-        status = "PASS" if result.ok else ("WARN" if not step.required else "NG")
+        validation_error = ""
+        step_ok = result.ok
+        if step_ok and step.validator is not None:
+            step_ok, validation_error = step.validator(result)
+        status = "PASS" if step_ok else ("WARN" if not step.required else "NG")
         detail = f"{elapsed_ms / 1000:.1f}s"
         if result.lines:
             detail += " | " + " ; ".join(_display_lines(result.lines))
         progress(index, step.label, status, detail)
-        error_reason = "" if result.ok else (result.lines[-1] if result.lines else "timeout")
+        error_reason = "" if step_ok else (validation_error or (result.lines[-1] if result.lines else "timeout"))
         response_summary = " ; ".join(_display_lines(result.lines)) if result.lines else ""
         record.log_item(station_type, step.label, step.command, status, elapsed_ms, error_reason, response_summary)
-        if step.required and not result.ok:
-            return FlowOutcome(False, "NG", f"{step.label} failed", results)
+        if step.required and not step_ok:
+            return FlowOutcome(False, "NG", validation_error or f"{step.label} failed", results)
     return FlowOutcome(True, "PASS", "completed", results)
 
 
@@ -150,6 +155,27 @@ def _with_factory_lock_cleanup(
 
 def _joined_lines(result: CommandResult) -> str:
     return " ; ".join(result.lines)
+
+
+def _sn_match_validator(expected_sn: str) -> Callable[[CommandResult], tuple[bool, str]]:
+    def validate(result: CommandResult) -> tuple[bool, str]:
+        sn_value = ""
+        sn_valid = ""
+        for line in result.lines:
+            parsed = parse_line(line)
+            if parsed.kind != "sn":
+                continue
+            sn_value = parsed.fields.get("value", "")
+            sn_valid = parsed.fields.get("valid", "")
+            break
+
+        if sn_valid != "1":
+            return False, f"device SN invalid: valid={sn_valid or 'missing'}"
+        if sn_value != expected_sn:
+            return False, f"SN mismatch: expected={expected_sn}, actual={sn_value or '<empty>'}"
+        return True, ""
+
+    return validate
 
 
 def _ota_state_locked(text: str) -> bool:
@@ -366,7 +392,7 @@ def run_full_machine(
         FlowStep("Read OTA busy", "AT+OTABUSY?"),
     ]
     if sn_enabled:
-        steps.insert(2, FlowStep("Read SN", "AT+SN?"))
+        steps.insert(2, FlowStep("Read SN", "AT+SN?", validator=_sn_match_validator(sn)))
     step_context = StepContext(start_index)
     cap_ok, cap_result = _check_factory_capability(client, record, "full", progress, step_context)
     if not cap_ok:

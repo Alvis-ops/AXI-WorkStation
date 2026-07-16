@@ -14,6 +14,43 @@ from .config import redact_sensitive_text
 # Batch disk flush: avoid per-row flush syscalls on industrial PCs (P1_1 B1/B1b).
 CSV_FLUSH_EVERY_ROWS = 50
 RAW_LOG_FLUSH_EVERY_LINES = 50
+MAX_STEP_MEASUREMENTS = 32
+
+TEST_ITEM_KEYS = {
+    "Firmware flash": "firmware_flash",
+    "Flash reconnect": "flash_reconnect",
+    "Factory AT capability": "factory_at_capability",
+    "AT probe": "at_probe",
+    "Read version": "firmware_version",
+    "Write SN": "sn_write",
+    "Read SN": "sn_read",
+    "SN persistence check": "sn_persistence",
+    "Read OTA busy": "ota_busy",
+    "Power path": "power_path",
+    "IMU communication": "imu_communication",
+    "Touch communication": "touch_communication",
+    "Charger communication": "charger_communication",
+    "Gauge communication": "gauge_communication",
+    "Flash communication": "storage_flash_communication",
+    "PPG communication": "ppg_communication",
+    "PPG dark capture": "ppg_dark_capture",
+    "Touch ISR": "touch_isr",
+    "Touch capture": "touch_capture",
+    "LRA vibcapture": "lra_vibcapture",
+    "PPG reflect capture": "ppg_reflect_capture",
+    "OTA transport check": "ota_transport_check",
+    "OTA version before": "ota_version_before",
+    "OTA busy check": "ota_busy_check",
+    "OTA image check": "ota_image_check",
+    "OTA disconnect NUS": "ota_disconnect_nus",
+    "OTA upload": "ota_upload",
+    "OTA reconnect NUS": "ota_reconnect_nus",
+    "OTA state check": "ota_state_check",
+    "OTA busy after same-hash": "ota_busy_after_same_hash",
+    "OTA reboot wait": "ota_reboot_wait",
+    "OTA busy after reboot": "ota_busy_after_reboot",
+    "OTA version after": "ota_version_after",
+}
 
 
 def _stamp() -> str:
@@ -27,6 +64,38 @@ def _iso() -> str:
 def _safe_name(text: str) -> str:
     value = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in text.strip())
     return value or "NA"
+
+
+def _item_key(item_name: str) -> str:
+    configured = TEST_ITEM_KEYS.get(item_name)
+    if configured:
+        return configured
+    value = "".join(ch.lower() if ch.isalnum() else "_" for ch in item_name.strip())
+    return "_".join(part for part in value.split("_") if part) or "unknown_item"
+
+
+@dataclass(frozen=True)
+class RecordedTestItem:
+    item_key: str
+    item_name: str
+    result: str
+    elapsed_ms: int
+    error_reason: str
+    response_summary: str
+    measurements: tuple[dict[str, Any], ...] = ()
+
+
+@dataclass(frozen=True)
+class RunSummary:
+    run_id: str
+    station: str
+    sn: str
+    dut_alias: str
+    process_started_at: str
+    process_ended_at: str
+    device_result: str
+    device_message: str
+    test_items: tuple[RecordedTestItem, ...]
 
 
 @dataclass
@@ -85,6 +154,9 @@ class RunRecord:
         self._event_index = 0
         self._step_index = ""
         self._step_name = ""
+        self._step_measurements: list[dict[str, Any]] = []
+        self._test_items: list[RecordedTestItem] = []
+        self._finished = False
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.raw_log = (self.run_dir / "raw_at.log").open("a", encoding="utf-8") if self.write_extra_files else None
         self._raw_log_lines_since_flush = 0
@@ -135,6 +207,7 @@ class RunRecord:
     def start_step(self, step_index: int, step_name: str, command: str) -> None:
         self._step_index = str(step_index)
         self._step_name = step_name
+        self._step_measurements = []
         self.log_event(
             "step_start",
             {"step_index": step_index, "step_name": step_name, "command": redact_sensitive_text(command)},
@@ -193,6 +266,17 @@ class RunRecord:
         error_reason: str,
         response_summary: str,
     ) -> None:
+        self._test_items.append(
+            RecordedTestItem(
+                item_key=_item_key(item_name),
+                item_name=item_name,
+                result=result,
+                elapsed_ms=int(elapsed_ms),
+                error_reason=error_reason,
+                response_summary=response_summary,
+                measurements=tuple(dict(item) for item in self._step_measurements),
+            )
+        )
         if self.write_extra_files:
             self._sink(
                 "factory_test_items",
@@ -232,13 +316,60 @@ class RunRecord:
                 "response_summary": response_summary,
             },
         )
+        self._step_measurements = []
         self.flush_writes()
 
-    def finish(self, result: str, details: str = "") -> None:
-        self.log_event("flow_end", {"result": result, "details": details})
+    def run_summary(
+        self,
+        *,
+        process_started_at: datetime | str,
+        process_ended_at: datetime | str,
+        device_result: str,
+        device_message: str,
+    ) -> RunSummary:
+        def iso(value: datetime | str) -> str:
+            return value.isoformat(timespec="seconds") if isinstance(value, datetime) else str(value)
+
+        return RunSummary(
+            run_id=self.run_id,
+            station=self.station,
+            sn=self.sn,
+            dut_alias=self.dut_alias,
+            process_started_at=iso(process_started_at),
+            process_ended_at=iso(process_ended_at),
+            device_result=device_result,
+            device_message=device_message,
+            test_items=tuple(self._test_items),
+        )
+
+    def finish(
+        self,
+        result: str,
+        details: str = "",
+        *,
+        mes_status: str = "",
+        mes_details: str = "",
+        mes_pending_path: str = "",
+    ) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        self.log_event(
+            "flow_end",
+            {
+                "result": result,
+                "details": details,
+                "mes_status": mes_status,
+                "mes_details": mes_details,
+                "mes_pending_path": mes_pending_path,
+            },
+        )
         self.meta["finished_at"] = datetime.now().isoformat(timespec="seconds")
         self.meta["result"] = result
         self.meta["details"] = details
+        self.meta["mes_status"] = mes_status
+        self.meta["mes_details"] = mes_details
+        self.meta["mes_pending_path"] = mes_pending_path
         if self.write_extra_files:
             (self.run_dir / "metadata.json").write_text(
                 json.dumps(self.meta, indent=2, ensure_ascii=False) + "\n",
@@ -270,6 +401,19 @@ class RunRecord:
 
     def ingest_line(self, line: str) -> None:
         parsed = parse_line(line)
+        if (
+            parsed.fields
+            and parsed.kind not in {"empty", "ok", "text", "touch_frame", "vib_frame", "ppg_frame"}
+            and len(self._step_measurements) < MAX_STEP_MEASUREMENTS
+        ):
+            self._step_measurements.append(
+                {
+                    "kind": parsed.kind,
+                    "category": parsed.category,
+                    "fields": dict(parsed.fields),
+                    "line": (parsed.line or line)[:1000],
+                }
+            )
         if parsed.kind not in ("empty", "ok", "text"):
             self.log_event(
                 parsed.kind,
@@ -506,6 +650,11 @@ class RunRecord:
 
 
 class NullRunRecord:
+    run_id = ""
+    station = ""
+    sn = ""
+    dut_alias = ""
+
     def log_at(self, direction: str, line: str) -> None:
         return None
 
@@ -527,11 +676,177 @@ class NullRunRecord:
     ) -> None:
         return None
 
-    def finish(self, result: str, details: str = "") -> None:
+    def run_summary(
+        self,
+        *,
+        process_started_at: datetime | str,
+        process_ended_at: datetime | str,
+        device_result: str,
+        device_message: str,
+    ) -> RunSummary:
+        return RunSummary(
+            run_id="",
+            station="",
+            sn="",
+            dut_alias="",
+            process_started_at=str(process_started_at),
+            process_ended_at=str(process_ended_at),
+            device_result=device_result,
+            device_message=device_message,
+            test_items=(),
+        )
+
+    def finish(
+        self,
+        result: str,
+        details: str = "",
+        *,
+        mes_status: str = "",
+        mes_details: str = "",
+        mes_pending_path: str = "",
+    ) -> None:
         return None
 
     def close(self) -> None:
         return None
+
+
+@dataclass(frozen=True)
+class HalfSnRecordCheck:
+    ok: bool
+    message: str
+    record_path: str = ""
+    result: str = ""
+
+
+def _half_sn_candidate(
+    *,
+    path: Path,
+    station: str,
+    sn: str,
+    target_sn: str,
+    result: str,
+    details: str = "",
+    timestamp: str = "",
+) -> dict[str, Any] | None:
+    if station.strip().upper() != "HALF":
+        return None
+    if sn.strip() != target_sn:
+        return None
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    return {
+        "path": str(path),
+        "result": result.strip().upper(),
+        "details": details.strip(),
+        "timestamp": timestamp.strip(),
+        "mtime": mtime,
+    }
+
+
+def _half_sn_candidates_from_unified(path: Path, target_sn: str) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    try:
+        with path.open("r", newline="", encoding="utf-8-sig") as file:
+            for row in csv.DictReader(file):
+                if row.get("event_type", "").strip() != "flow_end":
+                    continue
+                payload: dict[str, Any] = {}
+                try:
+                    payload = json.loads(row.get("payload_json", "") or "{}")
+                except json.JSONDecodeError:
+                    payload = {}
+                candidate = _half_sn_candidate(
+                    path=path,
+                    station=row.get("station_type", ""),
+                    sn=row.get("sn", ""),
+                    target_sn=target_sn,
+                    result=str(payload.get("result", "")),
+                    details=str(payload.get("details", "")),
+                    timestamp=row.get("timestamp_iso", ""),
+                )
+                if candidate is not None:
+                    candidates.append(candidate)
+    except OSError:
+        return []
+    return candidates
+
+
+def _half_sn_candidates_from_summary(path: Path, target_sn: str) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    try:
+        with path.open("r", newline="", encoding="utf-8-sig") as file:
+            for row in csv.DictReader(file):
+                candidate = _half_sn_candidate(
+                    path=path,
+                    station=row.get("station", ""),
+                    sn=row.get("sn", ""),
+                    target_sn=target_sn,
+                    result=row.get("result", ""),
+                    details=row.get("details", ""),
+                    timestamp=row.get("timestamp_iso", ""),
+                )
+                if candidate is not None:
+                    candidates.append(candidate)
+    except OSError:
+        return []
+    return candidates
+
+
+def _half_sn_candidates_from_metadata(path: Path, target_sn: str) -> list[dict[str, Any]]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    candidate = _half_sn_candidate(
+        path=path,
+        station=str(data.get("station", "")),
+        sn=str(data.get("sn", "")),
+        target_sn=target_sn,
+        result=str(data.get("result", "")),
+        details=str(data.get("details", "")),
+        timestamp=str(data.get("finished_at") or data.get("started_at") or ""),
+    )
+    return [candidate] if candidate is not None else []
+
+
+def verify_half_sn_pass_record(records_root: str | Path, sn: str) -> HalfSnRecordCheck:
+    target_sn = sn.strip()
+    root = Path(records_root)
+    if not target_sn:
+        return HalfSnRecordCheck(False, "SN 为空，无法校验半机记录")
+    if not root.exists():
+        return HalfSnRecordCheck(False, f"记录目录不存在，无法校验半机记录：{root}")
+
+    candidates: list[dict[str, Any]] = []
+    for unified in root.rglob("unified_log.csv"):
+        candidates.extend(_half_sn_candidates_from_unified(unified, target_sn))
+    for summary in root.rglob("summary.csv"):
+        candidates.extend(_half_sn_candidates_from_summary(summary, target_sn))
+    for metadata in root.rglob("metadata.json"):
+        candidates.extend(_half_sn_candidates_from_metadata(metadata, target_sn))
+
+    if not candidates:
+        return HalfSnRecordCheck(
+            False,
+            f"未找到 SN {target_sn} 的半机测试记录；请先完成半机测试，或确认半机/整机使用同一个记录目录：{root}",
+        )
+
+    latest = max(candidates, key=lambda item: (float(item.get("mtime", 0.0)), str(item.get("timestamp", ""))))
+    result = str(latest.get("result", ""))
+    record_path = str(latest.get("path", ""))
+    if result != "PASS":
+        details = str(latest.get("details", ""))
+        suffix = f"；详情：{details}" if details else ""
+        return HalfSnRecordCheck(
+            False,
+            f"SN {target_sn} 最新半机测试记录不是 PASS，而是 {result or 'UNKNOWN'}{suffix}；记录：{record_path}",
+            record_path,
+            result,
+        )
+    return HalfSnRecordCheck(True, f"SN {target_sn} 已找到半机 PASS 记录", record_path, result)
 
 
 class RunStorage:

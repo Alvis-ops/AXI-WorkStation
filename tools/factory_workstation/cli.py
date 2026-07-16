@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from dataclasses import replace
@@ -16,7 +17,8 @@ if __package__ in (None, ""):
     from factory_workstation.flash_flow import probe_at_client, record_flash_step
     from factory_workstation.flash_runner import FlashOutcome, run_flash
     from factory_workstation.flows import FlowOutcome, run_full_machine, run_half_machine
-    from factory_workstation.storage import NullRunRecord, RunStorage
+    from factory_workstation.mes_service import MesService, build_sample_post_payload, write_pending_request
+    from factory_workstation.storage import NullRunRecord, RunStorage, verify_half_sn_pass_record
     from factory_workstation.transport_ble import BLENusTransport
     from factory_workstation.transport_uart import UARTTransport
 else:
@@ -26,7 +28,8 @@ else:
     from .flash_flow import probe_at_client, record_flash_step
     from .flash_runner import FlashOutcome, run_flash
     from .flows import FlowOutcome, run_full_machine, run_half_machine
-    from .storage import NullRunRecord, RunStorage
+    from .mes_service import MesService, build_sample_post_payload, write_pending_request
+    from .storage import NullRunRecord, RunStorage, verify_half_sn_pass_record
     from .transport_ble import BLENusTransport
     from .transport_uart import UARTTransport
 
@@ -37,7 +40,11 @@ FlashRunner = Callable[[WorkstationConfig, Callable[[str, str], None] | None], F
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="POC3A factory workstation CLI")
-    parser.add_argument("flow", choices=("half", "full"), help="factory flow to run")
+    parser.add_argument(
+        "flow",
+        choices=("half", "full", "mes-checkroute", "mes-post"),
+        help="factory flow or MES diagnostic command",
+    )
     parser.add_argument("--config", default=str(CONFIG_PATH), help="config JSON path")
     parser.add_argument("--transport", choices=("uart", "ble"), help="transport override")
     parser.add_argument("--port", help="UART port, for example COM18")
@@ -80,6 +87,33 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--flash-timeout-s", type=float, help="chip flash subprocess timeout seconds")
     parser.add_argument("--no-flash-verify", action="store_true", help="skip nrfjprog --verify")
     parser.add_argument("--verbose-frames", action="store_true", help="print every capture frame line")
+    parser.add_argument(
+        "--mes-station",
+        choices=("half", "full"),
+        default="half",
+        help="MES station type for diagnostic commands",
+    )
+    parser.add_argument("--mes-payload", help="JSON payload file for mes-post")
+    parser.add_argument(
+        "--mes-send",
+        action="store_true",
+        help="actually send mes-post; without this flag the payload is previewed only",
+    )
+    parser.add_argument(
+        "--mes-result",
+        choices=("PASS", "FAIL"),
+        default="PASS",
+        help="result used by the generated mes-post sample payload",
+    )
+    parser.add_argument(
+        "--mes-http-2xx-is-success",
+        action="store_true",
+        help="diagnostic override: treat HTTP 2xx as MES business success",
+    )
+    parser.add_argument(
+        "--mes-success-field",
+        help="diagnostic override: dot-separated JSON response field used as MES success flag",
+    )
     sn_group = parser.add_mutually_exclusive_group()
     sn_group.add_argument("--sn-record", action="store_true", help="enable SN validation and records")
     sn_group.add_argument(
@@ -131,6 +165,10 @@ def _apply_overrides(config: WorkstationConfig, args: argparse.Namespace) -> tup
         config.flash_timeout_s = args.flash_timeout_s
     if args.no_flash_verify:
         config.flash_verify = False
+    if args.mes_http_2xx_is_success:
+        config.mes.http_2xx_is_success = True
+    if args.mes_success_field is not None:
+        config.mes.response_success_field = args.mes_success_field
 
     sn_enabled = config.sn_enabled
     if args.sn_record:
@@ -195,6 +233,72 @@ def _half_flash_config(config: WorkstationConfig) -> WorkstationConfig:
     return replace(config, flash_image_path=config.half_flash_image_path)
 
 
+def _print_json(value: object) -> None:
+    print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True), flush=True)
+
+
+def _load_json_object(path: str | Path) -> dict:
+    data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    if not isinstance(data, dict):
+        raise ValueError(f"MES payload must be a JSON object: {path}")
+    return data
+
+
+def _run_mes_command(config: WorkstationConfig, args: argparse.Namespace) -> int:
+    station_type = args.mes_station.upper()
+    service = MesService(config.mes)
+    if args.flow == "mes-checkroute":
+        sn = args.sn.strip()
+        if not sn:
+            raise ValueError("mes-checkroute requires --sn")
+        ok, reason = config.validate_sn(sn)
+        if not ok:
+            raise ValueError(reason)
+        payload, result = service.checkroute(sn, station_type)
+        _print_json({"operation": "checkroute", "request": payload, "result": result.to_dict()})
+        return 0 if result.confirmed else 3
+
+    if args.mes_payload:
+        payload = _load_json_object(args.mes_payload)
+    else:
+        sn = args.sn.strip()
+        if not sn:
+            raise ValueError("mes-post without --mes-payload requires --sn")
+        payload = build_sample_post_payload(
+            config.mes,
+            sn=sn,
+            station_type=station_type,
+            result=args.mes_result,
+        )
+    if not args.mes_send:
+        _print_json({"operation": "postxtdata-preview", "request": payload})
+        return 0
+
+    service.validate(station_type)
+    result = service.postxtdata(payload)
+    output: dict[str, object] = {
+        "operation": "postxtdata",
+        "request": payload,
+        "result": result.to_dict(),
+    }
+    if not result.confirmed:
+        data = payload.get("Data", {})
+        run_id = str(data.get("run_id", "")) if isinstance(data, dict) else ""
+        if not run_id:
+            run_id = f"MES_CLI_{int(time.time())}_{payload.get('SN', 'UNKNOWN')}"
+        pending_path = write_pending_request(
+            config.records_root,
+            run_id=run_id,
+            url=config.mes.postxtdata_url,
+            payload=payload,
+            operation="postxtdata",
+            last_error=result.message,
+        )
+        output["pending_path"] = str(pending_path)
+    _print_json(output)
+    return 0 if result.confirmed else 3
+
+
 def run(
     argv: list[str] | None = None,
     transport_factory: TransportFactory | None = None,
@@ -203,6 +307,12 @@ def run(
     args = _parse_args(argv)
     config = load_config(Path(args.config))
     mode, sn_enabled = _apply_overrides(config, args)
+    if args.flow.startswith("mes-"):
+        try:
+            return _run_mes_command(config, args)
+        except Exception as exc:
+            print(f"[ERR] {exc}", flush=True)
+            return 1
     sn = args.sn.strip() if sn_enabled else ""
     token = get_factory_token(args.token)
     factory = transport_factory or _default_transport_factory
@@ -222,6 +332,13 @@ def run(
         print("[INFO] 空跑模式：跳过 SN 校验、SN 写入和文件记录", flush=True)
         if not token:
             print("[INFO] 空跑模式：未填 token，将跳过 Factory unlock/lock", flush=True)
+
+    if sn_enabled and args.flow == "full":
+        half_sn_check = verify_half_sn_pass_record(config.records_root, sn)
+        if not half_sn_check.ok:
+            print(f"[RESULT] NG half SN record check failed: {half_sn_check.message}", flush=True)
+            return 2
+        print(f"[INFO] half SN record check PASS: {half_sn_check.record_path}", flush=True)
 
     record = None
     client: ATClient | None = None

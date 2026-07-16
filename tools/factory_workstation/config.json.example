@@ -45,5 +45,24 @@
     "vibcapture_s": 60.0,
     "ppg_capture_s": 45.0,
     "ota_s": 300.0
+  },
+  "mes": {
+    "checkroute_url": "http://192.168.3.58/json/J.php/xt/checkroute",
+    "postxtdata_url": "http://192.168.3.58/json/J.php/xt/postxtdata",
+    "device": "",
+    "line": "",
+    "half_station": "半机测试",
+    "full_station": "整机测试",
+    "timeout_s": 5.0,
+    "device_field": "Device",
+    "response_success_field": "",
+    "response_success_values": [
+      "1",
+      "true",
+      "ok",
+      "pass",
+      "success"
+    ],
+    "http_2xx_is_success": false
   }
 }

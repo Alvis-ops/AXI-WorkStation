@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -48,6 +48,7 @@ class FlashOutcome:
     elapsed_ms: int
     exit_code: int | None
     command: FlashCommand | None = None
+    output: str = ""
 
     @property
     def image_sha256(self) -> str:
@@ -64,6 +65,18 @@ class FlashOutcome:
     @property
     def jlink_probe_id(self) -> str:
         return self.command.jlink_probe_id if self.command is not None else ""
+
+
+@dataclass
+class JLinkDetectResult:
+    ok: bool
+    level: str
+    message: str
+    probe_ids: list[str] = field(default_factory=list)
+    nrfjprog_path: str = ""
+    nrfjprog_version: str = ""
+    exit_code: int | None = None
+    raw_output: str = ""
 
 
 def file_sha256(path: str | Path) -> str:
@@ -88,16 +101,16 @@ def _require_file(path_text: str, label: str) -> Path:
 def _jlink_dll_args(config: WorkstationConfig, *, require_file: bool = True) -> list[str]:
     dll_path = str(config.jlink_dll_path or "").strip()
     if not dll_path:
-        return []
+        raise ValueError("J-Link DLL is not configured; run the complete offline installer again")
     if require_file:
         dll_path = str(_require_file(dll_path, "J-Link DLL"))
     return ["--jdll", dll_path]
 
 
-def build_flash_command(config: WorkstationConfig) -> FlashCommand:
+def build_flash_command(config: WorkstationConfig, *, probe_id_override: str = "") -> FlashCommand:
     backend = str(config.flash_backend or "nrfjprog").strip().lower()
     env = os.environ.copy()
-    probe_id = str(config.jlink_probe_id or "").strip()
+    probe_id = str(probe_id_override or config.jlink_probe_id or "").strip()
     repo = str(config.firmware_repo or "").strip()
     cwd = repo if repo and Path(repo).exists() else str(Path.cwd())
 
@@ -150,11 +163,186 @@ def build_flash_command(config: WorkstationConfig) -> FlashCommand:
     raise ValueError(f"unsupported flash backend: {backend}")
 
 
+def _parse_probe_ids(output: str) -> list[str]:
+    probe_ids: list[str] = []
+    for raw in output.splitlines():
+        line = raw.strip()
+        if line.isdigit() and 6 <= len(line) <= 16:
+            probe_ids.append(line)
+    return probe_ids
+
+
+def _run_nrfjprog_tool(tool: str, args: list[str], timeout_s: float = 15.0) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [tool, *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout_s,
+        creationflags=CREATE_NO_WINDOW,
+    )
+
+
+def _detect_jlink_probes(config: WorkstationConfig, configured_probe: str) -> JLinkDetectResult:
+    tool = str(config.nrfjprog_path or "nrfjprog").strip() or "nrfjprog"
+    try:
+        jlink_dll_args = _jlink_dll_args(config)
+    except (FileNotFoundError, ValueError) as exc:
+        return JLinkDetectResult(False, "ERR", str(exc), nrfjprog_path=tool)
+
+    try:
+        version_proc = _run_nrfjprog_tool(tool, ["--version", *jlink_dll_args])
+        ids_proc = _run_nrfjprog_tool(tool, ["--ids", *jlink_dll_args])
+    except FileNotFoundError:
+        return JLinkDetectResult(False, "ERR", f"nrfjprog not found: {tool}", nrfjprog_path=tool)
+    except subprocess.TimeoutExpired:
+        return JLinkDetectResult(False, "ERR", "nrfjprog probe precheck timed out", nrfjprog_path=tool)
+    except Exception as exc:
+        return JLinkDetectResult(False, "ERR", f"nrfjprog probe precheck failed: {exc}", nrfjprog_path=tool)
+
+    version_output = "\n".join(part for part in (version_proc.stdout, version_proc.stderr) if part).strip()
+    ids_output = "\n".join(part for part in (ids_proc.stdout, ids_proc.stderr) if part).strip()
+    raw_output = "\n".join(part for part in (version_output, ids_output) if part)
+    probe_ids = _parse_probe_ids(ids_output)
+    version_line = next(
+        (line.strip() for line in version_output.splitlines() if line.strip().lower().startswith("nrfjprog version:")),
+        version_output,
+    )
+
+    if version_proc.returncode != 0 or JLINK_ERROR_256 in raw_output:
+        return JLinkDetectResult(
+            False,
+            "ERR",
+            f"Pinned J-Link DLL is incompatible with nrfjprog: {config.jlink_dll_path}",
+            probe_ids=probe_ids,
+            nrfjprog_path=tool,
+            nrfjprog_version=version_line,
+            exit_code=version_proc.returncode,
+            raw_output=raw_output,
+        )
+    if ids_proc.returncode != 0:
+        return JLinkDetectResult(
+            False,
+            "ERR",
+            translate_flash_failure(ids_proc.returncode, ids_output),
+            probe_ids=probe_ids,
+            nrfjprog_path=tool,
+            nrfjprog_version=version_line,
+            exit_code=ids_proc.returncode,
+            raw_output=raw_output,
+        )
+    if not probe_ids:
+        return JLinkDetectResult(
+            False,
+            "ERR",
+            "未检测到 J-Link 探头。请检查 J-Link USB 连接、驱动和供电后重试。",
+            nrfjprog_path=tool,
+            nrfjprog_version=version_line,
+            exit_code=41,
+            raw_output=raw_output,
+        )
+    if configured_probe:
+        if configured_probe not in probe_ids:
+            return JLinkDetectResult(
+                False,
+                "ERR",
+                f"已配置的 J-Link SNR {configured_probe} 未检测到；当前探头: {', '.join(probe_ids)}",
+                probe_ids=probe_ids,
+                nrfjprog_path=tool,
+                nrfjprog_version=version_line,
+                exit_code=41,
+                raw_output=raw_output,
+            )
+        return JLinkDetectResult(
+            True,
+            "OK",
+            f"已检测到配置的 J-Link SNR {configured_probe}",
+            probe_ids=probe_ids,
+            nrfjprog_path=tool,
+            nrfjprog_version=version_line,
+            exit_code=0,
+            raw_output=raw_output,
+        )
+    if len(probe_ids) > 1:
+        return JLinkDetectResult(
+            False,
+            "ERR",
+            f"检测到多个 J-Link 探头: {', '.join(probe_ids)}；请在设置中指定 J-Link SNR",
+            probe_ids=probe_ids,
+            nrfjprog_path=tool,
+            nrfjprog_version=version_line,
+            exit_code=41,
+            raw_output=raw_output,
+        )
+    return JLinkDetectResult(
+        True,
+        "OK",
+        f"检测到单个 J-Link SNR {probe_ids[0]}，将自动选用",
+        probe_ids=probe_ids,
+        nrfjprog_path=tool,
+        nrfjprog_version=version_line,
+        exit_code=0,
+        raw_output=raw_output,
+    )
+
+
+def scan_jlink_probes(config: WorkstationConfig) -> JLinkDetectResult:
+    """Enumerate attached probes without rejecting a stale configured SNR."""
+    return _detect_jlink_probes(config, "")
+
+
+def detect_jlink_probes(config: WorkstationConfig) -> JLinkDetectResult:
+    """Enumerate probes and validate the SNR used by either flash backend."""
+    backend = str(config.flash_backend or "nrfjprog").strip().lower()
+    if backend not in {"nrfjprog", "script"}:
+        return JLinkDetectResult(False, "ERR", f"unsupported flash backend: {backend}")
+    return _detect_jlink_probes(config, str(config.jlink_probe_id or "").strip())
+
+
+def precheck_nrfjprog_probe(config: WorkstationConfig) -> tuple[bool, str, list[str]]:
+    result = detect_jlink_probes(config)
+    return result.ok, result.message if not result.ok or result.level == "WARN" else "", result.probe_ids
+
+
+def translate_flash_failure(exit_code: int | None, output: str = "") -> str:
+    if exit_code == 41:
+        return "未检测到 J-Link 探头（nrfjprog exit 41）。请检查 J-Link USB 连接、驱动和供电后重试。"
+    lowered = (output or "").lower()
+    if exit_code == 33 or "error -102" in lowered or "unable to connect to a debugger" in lowered:
+        return "无法连接目标芯片（nrfjprog exit 33）。请检查 SWD 接线、目标板供电和调试口占用。"
+    if exit_code is None:
+        return "flash command failed before an exit code was returned"
+    return f"flash command failed with exit code {exit_code}"
+
+
 def run_flash(config: WorkstationConfig, line_callback: FlashLogCallback | None = None) -> FlashOutcome:
     started = time.monotonic()
     command: FlashCommand | None = None
     try:
-        command = build_flash_command(config)
+        detect_result = detect_jlink_probes(config)
+        if line_callback is not None:
+            line_callback("FLASH", f"J-Link precheck: {detect_result.message}")
+            for raw in detect_result.raw_output.splitlines():
+                line = raw.rstrip("\r\n")
+                if line:
+                    line_callback("PREFLIGHT", line)
+        if not detect_result.ok:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            return FlashOutcome(
+                False,
+                "NG",
+                detect_result.message,
+                elapsed_ms,
+                detect_result.exit_code if detect_result.exit_code is not None else 41,
+                command,
+                detect_result.raw_output,
+            )
+
+        probe_id_override = ""
+        if not str(config.jlink_probe_id or "").strip() and len(detect_result.probe_ids) == 1:
+            probe_id_override = detect_result.probe_ids[0]
+        command = build_flash_command(config, probe_id_override=probe_id_override)
         if line_callback is not None:
             line_callback("FLASH", command.display)
         proc = subprocess.Popen(
@@ -187,7 +375,7 @@ def run_flash(config: WorkstationConfig, line_callback: FlashLogCallback | None 
                     if line:
                         line_callback("FLASH", line)
                 line_callback("FLASH", f"ERROR: flash timeout after {timeout_s:.1f}s")
-            return FlashOutcome(False, "NG", f"flash timeout after {timeout_s:.1f}s", elapsed_ms, proc.returncode, command)
+            return FlashOutcome(False, "NG", f"flash timeout after {timeout_s:.1f}s", elapsed_ms, proc.returncode, command, output)
 
         exit_code = proc.returncode
         if line_callback is not None:
@@ -199,8 +387,8 @@ def run_flash(config: WorkstationConfig, line_callback: FlashLogCallback | None 
                 line_callback(level, line)
         elapsed_ms = int((time.monotonic() - started) * 1000)
         if exit_code == 0:
-            return FlashOutcome(True, "PASS", "flash completed", elapsed_ms, exit_code, command)
-        return FlashOutcome(False, "NG", f"flash command failed with exit code {exit_code}", elapsed_ms, exit_code, command)
+            return FlashOutcome(True, "PASS", "flash completed", elapsed_ms, exit_code, command, output or "")
+        return FlashOutcome(False, "NG", translate_flash_failure(exit_code, output or ""), elapsed_ms, exit_code, command, output or "")
     except Exception as exc:
         elapsed_ms = int((time.monotonic() - started) * 1000)
         if line_callback is not None:

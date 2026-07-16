@@ -8,4 +8,6 @@ __all__ = [
     "transport_ble",
     "storage",
     "flows",
+    "mes_client",
+    "mes_service",
 ]

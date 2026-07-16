@@ -24,10 +24,10 @@ from .config import (
     verify_engineer_password,
 )
 from .flash_flow import flash_payload, precheck_flash_request, probe_at_client, record_flash_step
-from .flash_runner import FlashOutcome, file_sha256, run_flash
+from .flash_runner import FlashOutcome, JLinkDetectResult, file_sha256, run_flash, scan_jlink_probes
 from .flows import FlowOutcome, run_full_machine, run_half_machine
 from .ota_runner import build_ota_command, run_ota
-from .storage import NullRunRecord, RunStorage
+from .storage import NullRunRecord, RunStorage, verify_half_sn_pass_record
 from .transport_ble import BLEDeviceInfo, BLENusTransport, scan_ble_devices
 from .transport_uart import UARTTransport, list_serial_ports
 
@@ -48,6 +48,7 @@ UI_CONTROL_EVENT_KINDS = frozenset(
         "popup",
         "flow_done",
         "ble_devices",
+        "jlink_scan_result",
     }
 )
 
@@ -761,6 +762,13 @@ class WorkstationApp(ttk.Window):
         ttk.Label(frame, text="J-Link ID").grid(row=5, column=0, sticky=tk.W, pady=3)
         self.flash_jlink_entry = ttk.Entry(frame, textvariable=self.jlink_var, width=34)
         self.flash_jlink_entry.grid(row=5, column=1, sticky=tk.EW, pady=3)
+        self.flash_jlink_scan_btn = ttk.Button(
+            frame,
+            text="扫描",
+            bootstyle="info",
+            command=self._scan_jlink_probe,
+        )
+        self.flash_jlink_scan_btn.grid(row=5, column=2, padx=(5, 0), pady=3, sticky=tk.EW)
         ttk.Label(frame, text="等待秒数").grid(row=6, column=0, sticky=tk.W, pady=3)
         self.flash_wait_entry = ttk.Entry(frame, textvariable=self.flash_after_wait_var, width=12)
         self.flash_wait_entry.grid(row=6, column=1, sticky=tk.W, pady=3)
@@ -863,6 +871,15 @@ class WorkstationApp(ttk.Window):
                 if control_name:
                     setattr(self, f"{control_name}_browse_btn", button)
                     self.settings_engineering_controls.append(button)
+            elif control_name == "flash_jlink":
+                self.settings_jlink_scan_btn = ttk.Button(
+                    frame,
+                    text="扫描",
+                    bootstyle="info",
+                    command=self._scan_jlink_probe,
+                )
+                self.settings_jlink_scan_btn.grid(row=row, column=2, padx=(5, 0), pady=3, sticky=tk.EW)
+                self.settings_engineering_controls.append(self.settings_jlink_scan_btn)
         flash_backend_row = len(rows)
         ttk.Label(frame, text="烧录方式").grid(row=flash_backend_row, column=0, sticky=tk.W, pady=3)
         self.settings_flash_backend_combo = ttk.Combobox(
@@ -1382,6 +1399,60 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _scan_jlink_probe(self) -> None:
+        if self.busy:
+            return
+        if not self.engineering_mode:
+            messagebox.showwarning("需要工程登录", "扫描烧录器属于工程操作，请先在“更多”中工程登录。")
+            return
+        self._save_settings(silent=True)
+        self._set_busy(True)
+        self._log("INFO", "开始扫描 J-Link 烧录器...")
+
+        def worker() -> None:
+            try:
+                self.events.put(("jlink_scan_result", scan_jlink_probes(self.config_model)))
+            except Exception as exc:
+                self.events.put((
+                    "jlink_scan_result",
+                    JLinkDetectResult(False, "ERR", f"扫描 J-Link 失败: {exc}"),
+                ))
+            finally:
+                self.events.put(("busy", False))
+
+        threading.Thread(target=worker, daemon=True, name="factory-jlink-scan").start()
+
+    def _apply_jlink_scan_result(self, result: JLinkDetectResult) -> None:
+        if result.nrfjprog_version:
+            self._log("INFO", f"nrfjprog: {result.nrfjprog_version}")
+        if result.ok and len(result.probe_ids) == 1:
+            probe_id = result.probe_ids[0]
+            previous = self.jlink_var.get().strip()
+            self.jlink_var.set(probe_id)
+            self.config_model.jlink_probe_id = probe_id
+            changed = f"（原配置 {previous}）" if previous and previous != probe_id else ""
+            try:
+                save_config(self.config_model)
+                message = f"检测到 J-Link ID {probe_id}，已自动填入并保存{changed}。"
+            except Exception as exc:
+                message = f"检测到 J-Link ID {probe_id}，已自动填入，但保存失败：{exc}"
+                self._log("WARN", message)
+                self._show_popup("warning", "扫描烧录器完成", message)
+                return
+            self._log("OK", message)
+            self._show_popup("info", "扫描烧录器完成", message)
+            return
+        if result.probe_ids:
+            message = (
+                f"检测到多个 J-Link：{', '.join(result.probe_ids)}。\n\n"
+                "请只连接当前工位探头后重新扫描，或在 J-Link ID 中手动填写目标探头。"
+            )
+            self._log("WARN", message.replace("\n", " "))
+            self._show_popup("warning", "检测到多个烧录器", message)
+            return
+        self._log("ERR", result.message)
+        self._show_popup("error", "扫描烧录器失败", result.message)
+
     def _close_client_for_flash(self) -> None:
         client = self.client
         self.client = None
@@ -1483,6 +1554,7 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
         for name in (
             "flash_run_btn",
             "flash_probe_btn",
+            "flash_jlink_scan_btn",
             "flash_backend_combo",
             "flash_image_entry",
             "flash_image_browse_btn",
@@ -1696,6 +1768,15 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
                     f"半机 SN：{self.last_half_sn}\n当前 SN：{sn}\n\n请确认产品和 SN。",
                 )
                 return
+            if kind == "full":
+                half_sn_check = verify_half_sn_pass_record(self.config_model.records_root, sn)
+                if not half_sn_check.ok:
+                    messagebox.showerror(
+                        "半机 SN 校验失败",
+                        f"{half_sn_check.message}\n\n整机测试已停止，请先完成同一 SN 的半机测试。",
+                    )
+                    return
+                self._log("OK", f"半机 SN 校验通过: {half_sn_check.record_path}")
         else:
             message = "当前未启用 SN/记录，本次测试不会写入 SN，也不会保存 CSV/测试记录。"
             if auto_flash:
@@ -2267,6 +2348,8 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
             self._show_flow_done_popup(outcome)
         elif kind == "ble_devices":
             self._update_ble_devices(event[1])
+        elif kind == "jlink_scan_result":
+            self._apply_jlink_scan_result(event[1])
 
     def _poll_events(self) -> None:
         self._ui_metrics["ticks"] += 1

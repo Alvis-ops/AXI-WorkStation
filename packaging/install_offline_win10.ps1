@@ -133,7 +133,7 @@ function Set-WorkstationDefaultFirmware {
     Copy-Item -LiteralPath $FirmwareSource -Destination $firmwareTarget -Force
 
     $configPath = Join-Path $InstallRoot "config.json"
-    Update-WorkstationFlashConfig -ConfigPath $configPath -PreserveExistingUserSettings -Values @{
+    Update-WorkstationFlashConfig -ConfigPath $configPath -PreserveExistingUserSettings -ReplaceMissingFilePathSettings @("flash_image_path", "half_flash_image_path") -Values @{
         half_flash_before_test = $false
         flash_backend = "nrfjprog"
         flash_image_path = "firmware\$($script:FirmwareLeaf)"

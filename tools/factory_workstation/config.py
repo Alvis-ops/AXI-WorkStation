@@ -83,6 +83,46 @@ class ATTimeouts:
         return self.default_s
 
 
+@dataclass
+class MesConfig:
+    checkroute_url: str = "http://192.168.3.58/json/J.php/xt/checkroute"
+    postxtdata_url: str = "http://192.168.3.58/json/J.php/xt/postxtdata"
+    device: str = ""
+    line: str = ""
+    half_station: str = "半机测试"
+    full_station: str = "整机测试"
+    timeout_s: float = 5.0
+    device_field: str = "Device"
+    response_success_field: str = ""
+    response_success_values: list[str] = field(
+        default_factory=lambda: ["1", "true", "ok", "pass", "success"]
+    )
+    http_2xx_is_success: bool = False
+
+    def station_name(self, station_type: str) -> str:
+        return self.full_station if station_type.strip().upper() == "FULL" else self.half_station
+
+    def validate(self, station_type: str = "HALF") -> tuple[bool, str]:
+        if not self.checkroute_url.strip():
+            return False, "MES checkroute_url is empty"
+        if not self.postxtdata_url.strip():
+            return False, "MES postxtdata_url is empty"
+        if not self.device.strip():
+            return False, "MES device is empty"
+        if not self.line.strip():
+            return False, "MES line is empty"
+        if not self.station_name(station_type).strip():
+            return False, f"MES station is empty for {station_type}"
+        if float(self.timeout_s) <= 0:
+            return False, "MES timeout_s must be greater than zero"
+        if not self.device_field:
+            return False, "MES device_field is empty"
+        return True, "OK"
+
+    def has_response_rule(self) -> bool:
+        return bool(self.response_success_field.strip() or self.http_2xx_is_success)
+
+
 _FACTORY_TOKEN_COMMAND_RE = re.compile(
     r"\b(AT\+FACTORY\s*=\s*(?:UNLOCK|EXIT|RECOVER|PRODUCTION|ENTER_PRODUCTION)\s*,\s*)"
     r"([^,\s;|]+)",
@@ -130,6 +170,7 @@ class WorkstationConfig:
     engineer_password_sha256: str = ""
     sn_rule: SNRule = field(default_factory=SNRule)
     at_timeouts: ATTimeouts = field(default_factory=ATTimeouts)
+    mes: MesConfig = field(default_factory=MesConfig)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "WorkstationConfig":
@@ -139,6 +180,8 @@ class WorkstationConfig:
                 cfg.sn_rule = SNRule(**{**asdict(cfg.sn_rule), **value})
             elif key == "at_timeouts" and isinstance(value, dict):
                 cfg.at_timeouts = ATTimeouts(**{**asdict(cfg.at_timeouts), **value})
+            elif key == "mes" and isinstance(value, dict):
+                cfg.mes = MesConfig(**{**asdict(cfg.mes), **value})
             elif hasattr(cfg, key):
                 setattr(cfg, key, value)
         if "half_flash_image_path" not in data and "flash_image_path" in data:

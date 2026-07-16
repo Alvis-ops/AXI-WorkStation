@@ -36,7 +36,7 @@ if __package__ in (None, ""):
     from factory_workstation.flash_runner import FlashCommand, FlashOutcome
     from factory_workstation import ota_runner
     from factory_workstation import transport_ble
-    from factory_workstation.storage import RunStorage
+    from factory_workstation.storage import RunStorage, verify_half_sn_pass_record
 else:
     from . import cli
     from . import flash_flow
@@ -56,7 +56,7 @@ else:
     from .flash_runner import FlashCommand, FlashOutcome
     from . import ota_runner
     from . import transport_ble
-    from .storage import RunStorage
+    from .storage import RunStorage, verify_half_sn_pass_record
 
 
 Progress = Callable[[int, str, str, str], None]
@@ -153,7 +153,7 @@ class FakeBleTransport(ScriptedTransport):
     default_responses = {
         "AT": ["OK"],
         "AT+VER?": ["+VER:version=0.0.1,build=smoke", "OK"],
-        "AT+SN?": ["+SN:value=SN001,source=lfs", "OK"],
+        "AT+SN?": ["+SN:value=SN001,valid=1,source=lfs,production=0,ret=0", "OK"],
         "AT+CAP?": ["+CAP:factory_prod=1", "OK"],
         "AT+OTABUSY?": ["+OTABUSY:locked=0", "OK"],
         "AT+OTA?": ["+OTA:locked=0,state=idle", "OK"],
@@ -195,6 +195,34 @@ def _progress(_index: int, _label: str, _status: str, _detail: str) -> None:
 def _assert(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
+
+
+def _write_half_record(records_root: str | Path, sn: str = "SN001", result: str = "PASS", split: bool = False) -> Path:
+    record = RunStorage(records_root, write_extra_files=split).start_run("HALF", sn, "")
+    run_dir = record.run_dir
+    record.finish(result, "completed" if result == "PASS" else "failed")
+    return run_dir
+
+
+def test_half_sn_record_check_requires_half_pass() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        missing = verify_half_sn_pass_record(tmp, "SN001")
+        _assert(not missing.ok and "未找到" in missing.message, "missing half record was accepted")
+
+        _write_half_record(tmp, "SN001", "NG")
+        failed = verify_half_sn_pass_record(tmp, "SN001")
+        _assert(not failed.ok and failed.result == "NG", "latest failed half record was accepted")
+
+        pass_dir = _write_half_record(tmp, "SN001", "PASS")
+        passed = verify_half_sn_pass_record(tmp, "SN001")
+        _assert(passed.ok, f"half PASS record was rejected: {passed.message}")
+        _assert(str(pass_dir / "unified_log.csv") == passed.record_path, "unified half record path mismatch")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        split_dir = _write_half_record(tmp, "SN002", "PASS", split=True)
+        passed = verify_half_sn_pass_record(tmp, "SN002")
+        _assert(passed.ok, f"split half PASS record was rejected: {passed.message}")
+        _assert(Path(passed.record_path).parent == split_dir, "split half record path mismatch")
 
 
 def test_sensitive_factory_tokens_are_redacted() -> None:
@@ -348,7 +376,7 @@ def _half_success_responses() -> dict[str, list[str]]:
         "AT+VER?": ["+VER:version=0.0.1,build=smoke", "OK"],
         "AT+FACTORY=UNLOCK,TOKEN": ["OK"],
         "AT+SN=SN001": ["OK"],
-        "AT+SN?": ["+SN:value=SN001,source=lfs", "OK"],
+        "AT+SN?": ["+SN:value=SN001,valid=1,source=lfs,production=0,ret=0", "OK"],
         "AT+HW=POWER": ["+HW:POWER:status=PASS", "OK"],
         "AT+HW=IMU,PROBE": ["+HW:IMU:PROBE:status=PASS", "OK"],
         "AT+HW=TOUCH,PROBE": ["+HW:TOUCH:PROBE:status=PASS", "OK"],
@@ -368,7 +396,7 @@ def _full_success_responses() -> dict[str, list[str]]:
         "AT+CAP?": ["+CAP:factory_prod=1", "OK"],
         "AT": ["OK"],
         "AT+VER?": ["+VER:version=0.0.1,build=smoke", "OK"],
-        "AT+SN?": ["+SN:value=SN001,source=lfs", "OK"],
+        "AT+SN?": ["+SN:value=SN001,valid=1,source=lfs,production=0,ret=0", "OK"],
         "AT+OTABUSY?": ["+OTABUSY:locked=0", "OK"],
         "AT+FACTORY=UNLOCK,TOKEN": ["OK"],
         TOUCH_CAPTURE_CMD: ["+HW:TOUCH:FRAME:0,0,0x02,0x00000000,0x00000001,100/101/102/103,1/2/3/4,90/91/92/93,80/81/82/83", "+HW:TOUCH:CAPTURE:samples=60", "OK"],
@@ -388,7 +416,7 @@ def test_unlock_failure_cleanup() -> None:
         "AT+VER?": ["+VER:version=0.0.1,build=smoke", "OK"],
         "AT+FACTORY=UNLOCK,TOKEN": ["OK"],
         "AT+SN=SN001": ["OK"],
-        "AT+SN?": ["+SN:value=SN001,source=lfs", "OK"],
+        "AT+SN?": ["+SN:value=SN001,valid=1,source=lfs,production=0,ret=0", "OK"],
         "AT+HW=POWER": ["+HW:POWER:status=PASS", "OK"],
         "AT+HW=IMU,PROBE": ["+HW:IMU:PROBE:status=PASS", "OK"],
         "AT+HW=TOUCH,PROBE": ["+HW:TOUCH:PROBE:status=PASS", "OK"],
@@ -477,7 +505,7 @@ def test_sn_enabled_missing_token_still_fails() -> None:
 
 def test_sn_persistence_failure_marks_half_ng() -> None:
     responses = _half_success_responses()
-    responses["AT+SN?"] = ["+SN:value=SN001,source=ram", "OK"]
+    responses["AT+SN?"] = ["+SN:value=SN001,valid=1,source=ram,production=0,ret=0", "OK"]
     transport = ScriptedTransport(responses=responses)
     record = FakeRecord()
     outcome = flows.run_half_machine(
@@ -495,6 +523,46 @@ def test_sn_persistence_failure_marks_half_ng() -> None:
     _assert(record.finished == ("NG", "SN persistence check failed"), "record finish did not fail SN persistence")
     sn_items = [item for item in record.items if item[1] == "SN persistence check"]
     _assert(sn_items and sn_items[-1][3] == "NG", "SN persistence item was not NG")
+
+
+def test_full_machine_sn_match_passes() -> None:
+    transport = ScriptedTransport(responses=_full_success_responses())
+    record = FakeRecord()
+    outcome = flows.run_full_machine(
+        ATClient(transport),
+        WorkstationConfig(factory_at_required=True, ota_enabled=False),
+        "SN001",
+        "TOKEN",
+        record,  # type: ignore[arg-type]
+        _progress,
+        sn_enabled=True,
+    )
+
+    _assert(outcome.result == "PASS", f"matching full-flow SN expected PASS, got {outcome.result}")
+    sn_items = [item for item in record.items if item[1] == "Read SN"]
+    _assert(sn_items and sn_items[-1][3] == "PASS", "matching full-flow SN check was not PASS")
+
+
+def test_full_machine_sn_mismatch_stops_flow() -> None:
+    responses = _full_success_responses()
+    responses["AT+SN?"] = ["+SN:value=SN002,valid=1,source=lfs,production=0,ret=0", "OK"]
+    transport = ScriptedTransport(responses=responses)
+    record = FakeRecord()
+    outcome = flows.run_full_machine(
+        ATClient(transport),
+        WorkstationConfig(factory_at_required=True, ota_enabled=False),
+        "SN001",
+        "TOKEN",
+        record,  # type: ignore[arg-type]
+        _progress,
+        sn_enabled=True,
+    )
+
+    _assert(outcome.result == "NG", f"mismatching full-flow SN expected NG, got {outcome.result}")
+    _assert("SN mismatch" in outcome.message, f"unexpected SN mismatch message: {outcome.message}")
+    _assert(TOUCH_CAPTURE_CMD not in transport.commands, "full flow continued after SN mismatch")
+    sn_items = [item for item in record.items if item[1] == "Read SN"]
+    _assert(sn_items and sn_items[-1][3] == "NG", "mismatching full-flow SN check was not NG")
 
 
 def test_capability_step_numbering_and_single_cap_query() -> None:
@@ -843,6 +911,7 @@ def test_cli_half_full_sn_modes() -> None:
         _assert(not any(cmd.startswith("AT+SN") for cmd in half_dry_commands), "CLI half dry-run used SN command")
 
     with tempfile.TemporaryDirectory() as tmp:
+        _write_half_record(tmp, "SN001", "PASS")
         exit_code, full_sn_commands = _run_cli_with_responses(
             [
                 "full",
@@ -869,6 +938,29 @@ def test_cli_half_full_sn_modes() -> None:
         _assert(PPG_REFLECT_CAPTURE_CMD in full_sn_commands, "CLI full SN did not use compact PPG capture")
         _assert(any(Path(tmp).glob("*/*/unified_log.csv")), "CLI full SN did not write unified_log.csv")
         _assert(not any(path.name != "unified_log.csv" for path in Path(tmp).glob("*/*/*")), "CLI full SN wrote extra record files")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        exit_code, missing_half_commands = _run_cli_with_responses(
+            [
+                "full",
+                "--transport",
+                "uart",
+                "--port",
+                "MOCK",
+                "--records-root",
+                tmp,
+                "--sn",
+                "SN001",
+                "--token",
+                "TOKEN",
+                "--sn-record",
+                "--no-ota",
+            ],
+            _full_success_responses(),
+        )
+        _assert(exit_code == 2, f"CLI full without half record exit={exit_code}")
+        _assert(missing_half_commands == [], "CLI full without half record contacted device")
+        _assert(not list(Path(tmp).glob("*")), "CLI full without half record wrote records")
 
     with tempfile.TemporaryDirectory() as tmp:
         exit_code, full_dry_commands = _run_cli_with_responses(
@@ -913,6 +1005,7 @@ def test_cli_half_full_sn_modes() -> None:
         _assert("AT+HW=TOUCH,ISR,CONFIRM" not in half_skip_momo_commands, "CLI half skip-momo ran Touch ISR")
 
     with tempfile.TemporaryDirectory() as tmp:
+        _write_half_record(tmp, "SN001", "PASS")
         exit_code, full_skip_momo_commands = _run_cli_with_responses(
             [
                 "full",
@@ -1038,33 +1131,54 @@ def test_cli_half_flash_reconnect_failure_stops_flow() -> None:
 
 
 def test_flash_precheck_multi_probe_policy() -> None:
-    original_run = flash_flow.subprocess.run
+    original_tool = flash_runner._run_nrfjprog_tool
 
     class FakeCompleted:
-        returncode = 0
-        stdout = "11111111\n22222222\n"
-        stderr = ""
+        def __init__(self, output: str) -> None:
+            self.returncode = 0
+            self.stdout = output
+            self.stderr = ""
 
-    def fake_run(*_args, **_kwargs):
-        return FakeCompleted()
+    calls: list[list[str]] = []
 
-    flash_flow.subprocess.run = fake_run  # type: ignore[assignment]
+    def fake_tool(_tool: str, args: list[str], timeout_s: float = 15.0):
+        _ = timeout_s
+        calls.append(args)
+        return FakeCompleted("nrfjprog version: mock\n" if "--version" in args else "11111111\n22222222\n")
+
+    flash_runner._run_nrfjprog_tool = fake_tool  # type: ignore[assignment]
     try:
         with tempfile.TemporaryDirectory() as tmp:
             image = Path(tmp) / "merged.hex"
             image.write_text(":00000001FF\n", encoding="ascii")
-            config = WorkstationConfig(flash_image_path=str(image), jlink_probe_id="")
+            dll = Path(tmp) / "JLinkARM.dll"
+            dll.write_bytes(b"mock")
+            config = WorkstationConfig(flash_image_path=str(image), jlink_dll_path=str(dll), jlink_probe_id="")
             formal = flash_flow.precheck_flash_request(config, sn_enabled=True, dry_run=False)
             dry = flash_flow.precheck_flash_request(config, sn_enabled=False, dry_run=True)
 
             _assert(not formal.ok and formal.level == "ERR", "formal multi-probe precheck did not block")
-            _assert(dry.ok and dry.level == "WARN", "dry-run multi-probe precheck did not warn")
+            _assert(not dry.ok and dry.level == "ERR", "dry-run multi-probe precheck did not block")
+            _assert(sum("--ids" in args for args in calls) == 2, "nrfjprog --ids was not run for each precheck")
+
+            configured = WorkstationConfig(flash_image_path=str(image), jlink_dll_path=str(dll), jlink_probe_id="22222222")
+            configured_result = flash_flow.precheck_flash_request(configured, sn_enabled=True, dry_run=False)
+            _assert(configured_result.ok, "configured probe was not validated against --ids")
 
             script = Path(tmp) / "flash.ps1"
             script.write_text("exit 0\n", encoding="utf-8")
-            script_config = WorkstationConfig(flash_backend="script", flash_script_path=str(script), jlink_probe_id="")
+            script_config = WorkstationConfig(
+                flash_backend="script",
+                flash_script_path=str(script),
+                jlink_dll_path=str(dll),
+                jlink_probe_id="",
+            )
             script_result = flash_flow.precheck_flash_request(script_config, sn_enabled=True, dry_run=False)
-            _assert(script_result.ok and script_result.level == "WARN", "script backend probe policy is too strict")
+            _assert(not script_result.ok and script_result.level == "ERR", "script backend allowed ambiguous probes")
+
+            script_config.jlink_probe_id = "22222222"
+            script_selected = flash_flow.precheck_flash_request(script_config, sn_enabled=True, dry_run=False)
+            _assert(script_selected.ok, "script backend did not validate the selected probe")
 
             empty_image = WorkstationConfig(flash_image_path="", jlink_probe_id="123")
             empty_image_result = flash_flow.precheck_flash_request(empty_image, sn_enabled=True, dry_run=False)
@@ -1082,11 +1196,85 @@ def test_flash_precheck_multi_probe_policy() -> None:
             directory_script_result = flash_flow.precheck_flash_request(directory_script, sn_enabled=True, dry_run=False)
             _assert(not directory_script_result.ok and "not a file" in directory_script_result.message, "directory flash script was accepted")
     finally:
-        flash_flow.subprocess.run = original_run  # type: ignore[assignment]
+        flash_runner._run_nrfjprog_tool = original_tool  # type: ignore[assignment]
+
+
+def test_jlink_scan_autofill_and_script_env() -> None:
+    from factory_workstation import ui_main as ui_mod
+
+    original_tool = flash_runner._run_nrfjprog_tool
+    original_save_config = ui_mod.save_config
+
+    class FakeCompleted:
+        def __init__(self, output: str) -> None:
+            self.returncode = 0
+            self.stdout = output
+            self.stderr = ""
+
+    def fake_tool(_tool: str, args: list[str], timeout_s: float = 15.0):
+        _ = timeout_s
+        return FakeCompleted("nrfjprog version: mock\n" if "--version" in args else "69730336\n")
+
+    class FakeVar:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+        def get(self) -> str:
+            return self.value
+
+        def set(self, value: str) -> None:
+            self.value = value
+
+    flash_runner._run_nrfjprog_tool = fake_tool  # type: ignore[assignment]
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "flash.ps1"
+            script.write_text("exit 0\n", encoding="utf-8")
+            dll = Path(tmp) / "JLinkARM.dll"
+            dll.write_bytes(b"mock")
+            config = WorkstationConfig(
+                flash_backend="script",
+                flash_script_path=str(script),
+                nrfjprog_path="mock-nrfjprog",
+                jlink_dll_path=str(dll),
+                jlink_probe_id="69730371",
+            )
+
+            scan = flash_runner.scan_jlink_probes(config)
+            _assert(scan.ok and scan.probe_ids == ["69730336"], "manual scan did not ignore stale configured ID")
+            strict = flash_runner.detect_jlink_probes(config)
+            _assert(not strict.ok and "69730371" in strict.message, "formal precheck accepted a missing configured ID")
+
+            config.jlink_probe_id = "69730336"
+            selected = flash_flow.precheck_flash_request(config, sn_enabled=True, dry_run=False)
+            _assert(selected.ok, "script backend rejected the scanned probe")
+            command = flash_runner.build_flash_command(config)
+            _assert(command.env.get("POC3A_JLINK_ID") == "69730336", "script command did not export selected probe ID")
+
+            saved: list[str] = []
+            logs: list[tuple[str, str]] = []
+            popups: list[tuple[str, str, str]] = []
+            ui_mod.save_config = lambda cfg: saved.append(cfg.jlink_probe_id)  # type: ignore[assignment]
+            app = object.__new__(ui_mod.WorkstationApp)
+            app.jlink_var = FakeVar("69730371")
+            app.config_model = WorkstationConfig(jlink_probe_id="69730371")
+            app._log = lambda level, message: logs.append((level, message))
+            app._show_popup = lambda level, title, message: popups.append((level, title, message))
+            app._apply_jlink_scan_result(scan)
+
+            _assert(app.jlink_var.get() == "69730336", "GUI did not auto-fill scanned probe ID")
+            _assert(app.config_model.jlink_probe_id == "69730336", "GUI model did not update scanned probe ID")
+            _assert(saved == ["69730336"], "GUI did not persist scanned probe ID")
+            _assert(logs and logs[-1][0] == "OK", "GUI did not log successful probe scan")
+            _assert(popups and popups[-1][0] == "info", "GUI did not report successful probe scan")
+    finally:
+        flash_runner._run_nrfjprog_tool = original_tool  # type: ignore[assignment]
+        ui_mod.save_config = original_save_config  # type: ignore[assignment]
 
 
 def test_flash_runner_timeout_and_jlink_noise() -> None:
     original_popen = flash_runner.subprocess.Popen
+    original_tool = flash_runner._run_nrfjprog_tool
 
     class TimeoutProc:
         def __init__(self, *_args, **_kwargs) -> None:
@@ -1113,26 +1301,57 @@ def test_flash_runner_timeout_and_jlink_noise() -> None:
         def communicate(self, timeout=None):
             return "JLinkARM.dll reported error -256\nVerified OK\n", None
 
+    class NoDebuggerProc:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.returncode = 41
+
+        def communicate(self, timeout=None):
+            return "No debuggers were discovered.\n", None
+
+    class FakeCompleted:
+        def __init__(self, output: str) -> None:
+            self.returncode = 0
+            self.stdout = output
+            self.stderr = ""
+
+    def fake_tool(_tool: str, args: list[str], timeout_s: float = 15.0):
+        _ = timeout_s
+        return FakeCompleted("nrfjprog version: mock\n" if "--version" in args else "69730371\n")
+
     try:
         with tempfile.TemporaryDirectory() as tmp:
             image = Path(tmp) / "merged.hex"
             image.write_text(":00000001FF\n", encoding="ascii")
-            config = WorkstationConfig(flash_image_path=str(image), nrfjprog_path="mock-nrfjprog")
+            dll = Path(tmp) / "JLinkARM.dll"
+            dll.write_bytes(b"mock")
+            config = WorkstationConfig(flash_image_path=str(image), nrfjprog_path="mock-nrfjprog", jlink_dll_path=str(dll))
             config.flash_timeout_s = 1.0
+            flash_runner._run_nrfjprog_tool = fake_tool  # type: ignore[assignment]
 
             lines: list[tuple[str, str]] = []
             flash_runner.subprocess.Popen = TimeoutProc  # type: ignore[assignment]
             timeout_outcome = flash_runner.run_flash(config, lambda direction, line: lines.append((direction, line)))
             _assert(timeout_outcome.result == "NG", "timeout flash did not return NG")
             _assert("timeout" in timeout_outcome.message, "timeout flash message missing timeout")
+            _assert(timeout_outcome.jlink_probe_id == "69730371", "single detected probe was not selected")
+            _assert(timeout_outcome.command is not None, "flash command was not recorded")
+            _assert("--verify" in timeout_outcome.command.argv and "--reset" in timeout_outcome.command.argv, "verify/reset missing")
+            _assert("--snr" in timeout_outcome.command.argv, "selected SNR missing from flash command")
+            _assert(any(direction == "PREFLIGHT" for direction, _line in lines), "preflight output was not logged")
 
             lines.clear()
             flash_runner.subprocess.Popen = SuccessProc  # type: ignore[assignment]
             ok_outcome = flash_runner.run_flash(config, lambda direction, line: lines.append((direction, line)))
             _assert(ok_outcome.ok, "JLinkARM -256 noise made flash fail")
             _assert(("FLASH_WARN", "JLinkARM.dll reported error -256") in lines, "JLinkARM -256 was not downgraded")
+
+            flash_runner.subprocess.Popen = NoDebuggerProc  # type: ignore[assignment]
+            no_debugger_outcome = flash_runner.run_flash(config)
+            _assert(no_debugger_outcome.exit_code == 41, "nrfjprog exit 41 was lost")
+            _assert("未检测到 J-Link" in no_debugger_outcome.message, "exit 41 was not translated")
     finally:
         flash_runner.subprocess.Popen = original_popen  # type: ignore[assignment]
+        flash_runner._run_nrfjprog_tool = original_tool  # type: ignore[assignment]
 
 
 def test_cli_frame_output_filtering() -> None:
@@ -1386,6 +1605,7 @@ def test_ui_log_batch_op_filter_and_poll_split() -> None:
 
 def main() -> int:
     tests = [
+        test_half_sn_record_check_requires_half_pass,
         test_sensitive_factory_tokens_are_redacted,
         test_engineer_password_and_saved_token,
         test_save_engineer_password_sha256_only,
@@ -1394,6 +1614,8 @@ def main() -> int:
         test_sn_disabled_half_without_token_skips_factory_gate,
         test_sn_enabled_missing_token_still_fails,
         test_sn_persistence_failure_marks_half_ng,
+        test_full_machine_sn_match_passes,
+        test_full_machine_sn_mismatch_stops_flow,
         test_capability_step_numbering_and_single_cap_query,
         test_sn_disabled_full_without_token_skips_factory_gate,
         test_full_capture_timeouts_have_minimums,
@@ -1405,6 +1627,7 @@ def main() -> int:
         test_cli_half_flash_before_test,
         test_cli_half_flash_reconnect_failure_stops_flow,
         test_flash_precheck_multi_probe_policy,
+        test_jlink_scan_autofill_and_script_env,
         test_flash_runner_timeout_and_jlink_noise,
         test_cli_frame_output_filtering,
         test_ota_command_uses_dongle_backend,

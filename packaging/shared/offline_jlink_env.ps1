@@ -643,18 +643,29 @@ function Update-WorkstationFlashConfig {
     param(
         [string]$ConfigPath,
         [hashtable]$Values,
-        [switch]$PreserveExistingUserSettings
+        [switch]$PreserveExistingUserSettings,
+        [string[]]$ReplaceMissingFilePathSettings = @()
     )
 
     if (-not (Test-Path -LiteralPath $ConfigPath)) {
         throw "Workstation config not found: $ConfigPath"
     }
     $config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
+    $configDir = Split-Path -Parent $ConfigPath
     foreach ($key in $Values.Keys) {
         $value = $Values[$key]
         if ($PreserveExistingUserSettings -and $config.PSObject.Properties.Name -contains $key) {
             $existing = [string]$config.$key
-            if ($existing) { continue }
+            $replaceMissingPath = $false
+            if ($existing -and $ReplaceMissingFilePathSettings -contains $key) {
+                $existingPath = if ([System.IO.Path]::IsPathRooted($existing)) {
+                    $existing
+                } else {
+                    Join-Path $configDir $existing
+                }
+                $replaceMissingPath = -not (Test-Path -LiteralPath $existingPath -PathType Leaf)
+            }
+            if ($existing -and -not $replaceMissingPath) { continue }
         }
         $config | Add-Member -NotePropertyName $key -NotePropertyValue $value -Force
     }

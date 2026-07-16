@@ -39,10 +39,38 @@ python tools\factory_workstation\cli.py full --transport ble --ble-backend nrf_d
 python tools\factory_workstation\cli.py full --transport uart --port COM18 --baudrate 460800 --sn AXIP1TEST001 --token <token> --no-ota --record-output-mode split
 ```
 
+MES diagnostic CLI:
+
+```powershell
+# Send checkroute and print the complete request/response.
+# This returns exit code 3 when HTTP succeeds but the MES business success rule is not configured.
+python tools\factory_workstation\cli.py mes-checkroute --sn AXIP1TEST001
+
+# Temporarily treat HTTP 2xx as success while investigating an undocumented MES response.
+python tools\factory_workstation\cli.py mes-checkroute --sn AXIP1TEST001 --mes-http-2xx-is-success
+
+# Preview a nested postxtdata payload without sending it.
+python tools\factory_workstation\cli.py mes-post --sn AXIP1TEST001 --mes-station full
+
+# Send a reviewed JSON payload file explicitly.
+python tools\factory_workstation\cli.py mes-post --mes-payload .\mes_payload.json --mes-send
+```
+
+The `mes` section in `config.json` contains the two URLs, device ID, line, half/full station names,
+timeout and response-success rule. MES has no independent runtime enable switch: formal
+`启用 SN/记录` mode will use MES when the production flow integration is enabled, while
+`--no-sn-record` remains the explicit local dry-run mode. The current implementation exposes
+the HTTP/data/pending foundation and diagnostic CLI; it does not yet change the formal half/full
+test sequencing because the production MES response schema is still undocumented.
+
+If `mes-post --mes-send` cannot confirm success, the CLI writes
+`factory_records/mes_pending/<run_id>.json`. It does not retry automatically.
+
 Host smoke:
 
 ```powershell
 python tools\factory_workstation\smoke_p1_0h.py
+python tools\factory_workstation\smoke_mes.py
 ```
 
 Defaults:
@@ -57,7 +85,7 @@ Defaults:
 - Default OTA image: `build_ondemand/axi-p1-embeded/zephyr/zephyr.signed.bin`. The older top-level `build_ondemand/dfu_application.zip` may be stale after incremental builds.
 - Runtime tokens: environment or `tools/factory_workstation/.env`, not `config.json`.
 - Chip flash: optional and disabled by default. Engineering mode can enable `half_flash_before_test`, select `nrfjprog` or `script`, choose independent flash image `flash_image_path`, choose half-machine pre-test flash image `half_flash_image_path`, set `jlink_probe_id`, and set `flash_after_wait_s`. When enabled, half-machine test first flashes `half_flash_image_path`, then reconnects and runs the original half-machine AT flow.
-- `nrfjprog` flashing uses `flash_timeout_s` (default 180 seconds). Offline installs pin `jlink_dll_path` to Nordic-compatible J-Link 7.94e and pass it through `nrfjprog --jdll`. Multi-probe stations should set `jlink_probe_id`. Use the GUI `烧录检测` button for an optional J-Link/`nrfjprog --ids` check; flash start no longer runs that probe automatically.
+- `nrfjprog` flashing uses `flash_timeout_s` (default 180 seconds). Offline installs pin `jlink_dll_path` to Nordic-compatible J-Link 7.94e and every flash passes it through `nrfjprog --jdll`. Every flash also runs `nrfjprog --version` and `--ids`: a single detected probe is selected automatically; multi-probe stations must set `jlink_probe_id` (SNR), and a configured SNR must be detected. Exit code 41 is reported as “未检测到 J-Link 探头”.
 - Capture output: `capture_output_mode` defaults to `compact`. The workstation sends `...,COMPACT` capture commands for MOMO empty capture, LRA vibcapture and PPG reflect capture when the firmware supports it. Set `capture_output_mode` to `legacy` for older firmware.
 - Record output: `record_output_mode` defaults to `unified`. In the GUI settings page, set `记录格式` to `集成记录（单个 unified_log.csv）` or `分散记录（兼容多文件）`. CLI can override it with `--record-output-mode unified|split`.
 
@@ -96,10 +124,12 @@ With the default `nrf_dongle` backend, the workstation scans, connects, enables 
 - Default backend: `nrfjprog`.
 - Default images in the offline installer: both independent flashing and half-machine pre-test flashing point to `firmware\axi_p1_factory_merged.hex`.
 - Independent flashing is available on the `芯片烧录` tab after engineering login and uses `flash_image_path`.
-- Starting a flash only does a fast local path check (hex/script exists). The slow J-Link/`nrfjprog --ids` probe is **manual**: use the `烧录检测` button on the flash tab when needed.
+- The `J-Link ID` scan button enumerates attached probes. A single probe is filled into the GUI and saved automatically; multiple probes require the engineer to leave only the target connected or enter the intended ID.
+- Starting every `nrfjprog` flash performs the pinned-DLL J-Link precheck (`--version`, then `--ids`) in addition to local path validation. The `烧录检测` button remains available for an explicit check before starting a job.
+- The same probe enumeration and configured-ID validation applies to the `script` backend, and the selected ID is passed to `flash_poc3a.ps1` for `west flash --dev-id` selection.
 - Half-machine flash-before-test is configured in `设置` and uses `half_flash_image_path`. When enabled, the workstation closes any current UART/BLE connection, runs J-Link flashing, waits `flash_after_wait_s`, reconnects with the selected transport, probes `AT` and `AT+VER?`, then starts the existing half-machine flow.
 - Flash failures stop the half-machine flow before `AT+FACTORY=UNLOCK`.
-- In SN/record mode, `unified_log.csv` contains `flash_start`, `flash_log`, `flash_end`, and a `Firmware flash` step. In dry-run mode, no formal CSV record is created.
+- In SN/record mode, `unified_log.csv` contains `flash_start`, preflight/flash logs, `flash_end` (including selected SNR, full command, output, checksum, verification and reset result), and a `Firmware flash` step. In dry-run mode, no formal CSV record is created.
 
 ## Factory AT capability probe
 
