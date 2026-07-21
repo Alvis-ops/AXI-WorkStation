@@ -6,8 +6,9 @@ param(
     [string]$JLinkInstallerPath = "",
     [string]$NordicCliInstallerPath = "",
     [string]$FirmwareHexPath = "",
+    [string]$FirmwareOtaPath = "",
     [string]$OutputDir = "",
-    [string]$PackageRevision = "r8",
+    [string]$PackageRevision = "r14",
     [switch]$DownloadVcRedist,
     [switch]$SkipNrfConnect,
     [switch]$SkipJLink,
@@ -118,6 +119,10 @@ function Find-LocalFirmwareHex {
         return (Resolve-Path -LiteralPath $FirmwareHexPath).Path
     }
     $workspaceRoot = Split-Path -Parent $repoRoot
+    $firmwareRepoHex = Join-Path $workspaceRoot "axi-p1-embeded\build_ondemand\merged.hex"
+    if (Test-Path -LiteralPath $firmwareRepoHex) {
+        return (Resolve-Path -LiteralPath $firmwareRepoHex).Path
+    }
     foreach ($root in @($repoRoot, $workspaceRoot)) {
         if (-not $root -or -not (Test-Path -LiteralPath $root)) { continue }
         $direct = Join-Path $root "build_ondemand\merged.hex"
@@ -126,6 +131,18 @@ function Find-LocalFirmwareHex {
         }
     }
     return Find-FirstFile -Roots @($distRoot, $repoRoot, $workspaceRoot) -Patterns @("merged.hex", "axi_p1_factory_merged.hex")
+}
+
+function Find-LocalFirmwareOta {
+    if ($FirmwareOtaPath -and (Test-Path -LiteralPath $FirmwareOtaPath)) {
+        return (Resolve-Path -LiteralPath $FirmwareOtaPath).Path
+    }
+    $workspaceRoot = Split-Path -Parent $repoRoot
+    $candidate = Join-Path $workspaceRoot "axi-p1-embeded\build_ondemand\axi-p1-embeded\zephyr\zephyr.signed.bin"
+    if (Test-Path -LiteralPath $candidate) {
+        return (Resolve-Path -LiteralPath $candidate).Path
+    }
+    return Find-FirstFile -Roots @($distRoot, $repoRoot, $workspaceRoot) -Patterns @("zephyr.signed.bin")
 }
 
 function New-WorkstationPayload {
@@ -137,6 +154,11 @@ function New-WorkstationPayload {
     if (-not (Test-Path -LiteralPath (Join-Path $SourceAppDir "Axi Factory Workstation.exe"))) {
         throw "Workstation app folder is invalid: $SourceAppDir"
     }
+    foreach ($requiredExe in @("Axi Factory Workstation CLI.exe", "Axi OTA Helper.exe")) {
+        if (-not (Test-Path -LiteralPath (Join-Path $SourceAppDir $requiredExe))) {
+            throw "Workstation app folder is missing required executable: $requiredExe"
+        }
+    }
 
     $stageRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("AxiFactoryPayload_" + [System.Guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $stageRoot -Force | Out-Null
@@ -146,13 +168,21 @@ function New-WorkstationPayload {
             Copy-Item -LiteralPath $_.FullName -Destination $stageRoot -Recurse -Force
         }
         $stageConfig = Join-Path $stageRoot "config.json"
-        if (-not (Test-Path -LiteralPath $stageConfig)) {
-            $exampleConfig = Join-Path $repoRoot "tools\factory_workstation\config.json.example"
-            if (-not (Test-Path -LiteralPath $exampleConfig)) {
-                throw "Default config template not found: $exampleConfig"
-            }
-            Copy-Item -LiteralPath $exampleConfig -Destination $stageConfig -Force
+        $exampleConfig = Join-Path $repoRoot "tools\factory_workstation\config.json.example"
+        if (-not (Test-Path -LiteralPath $exampleConfig)) {
+            throw "Default config template not found: $exampleConfig"
         }
+        Copy-Item -LiteralPath $exampleConfig -Destination $stageConfig -Force
+        Copy-Item -LiteralPath (Join-Path $repoRoot "tools\factory_workstation\flash_selected_image.ps1") -Destination (Join-Path $stageRoot "flash_selected_image.ps1") -Force
+        $config = Get-Content -LiteralPath $stageConfig -Raw -Encoding UTF8 | ConvertFrom-Json
+        $config.firmware_repo = "."
+        $config.flash_script_path = "flash_selected_image.ps1"
+        $config.flash_image_path = "firmware\axi_p1_factory_merged.hex"
+        $config.half_flash_image_path = "firmware\axi_p1_factory_merged.hex"
+        $config.ota_image_path = "firmware\zephyr.signed.bin"
+        if (-not $config.mes.device) { $config.mes.device = "DE0001" }
+        if (-not $config.mes.line) { $config.mes.line = "L1" }
+        Write-Utf8NoBomText -Path $stageConfig -Text ($config | ConvertTo-Json -Depth 10)
         Write-Utf8NoBom -Path (Join-Path $stageRoot ".env.template") -Lines @(
             "AXI_FACTORY_ENGINEER_TOKEN=",
             "AXI_FACTORY_RECOVER_TOKEN=",
@@ -343,6 +373,7 @@ if (-not $SkipNordicCli) {
 }
 
 $firmwareHexDest = Join-Path $firmwareDir "axi_p1_factory_merged.hex"
+$firmwareOtaDest = Join-Path $firmwareDir "zephyr.signed.bin"
 if (-not $SkipFirmware) {
     $localFirmwareHex = Find-LocalFirmwareHex
     if ($localFirmwareHex) {
@@ -350,6 +381,13 @@ if (-not $SkipFirmware) {
         Copy-Item -LiteralPath $localFirmwareHex -Destination $firmwareHexDest -Force
     } else {
         Write-Warning "Default firmware merged.hex not found."
+    }
+    $localFirmwareOta = Find-LocalFirmwareOta
+    if ($localFirmwareOta) {
+        Write-Host "Copying default OTA image: $localFirmwareOta"
+        Copy-Item -LiteralPath $localFirmwareOta -Destination $firmwareOtaDest -Force
+    } else {
+        Write-Warning "Default OTA zephyr.signed.bin not found."
     }
 }
 
@@ -364,6 +402,7 @@ if (-not $nrfCopied) { $missingDeps += "deps/nrfconnect-bluetooth-low-energy/" }
 if (-not (Test-Path -LiteralPath $vcRedistDest)) { $missingDeps += "deps/vc_redist.x64.exe" }
 if (-not (Test-Path -LiteralPath $nordicCliInstallerDest)) { $missingDeps += "deps/nordic-command-line-tools-installer.exe" }
 if (-not (Test-Path -LiteralPath $firmwareHexDest)) { $missingDeps += "firmware/axi_p1_factory_merged.hex" }
+if (-not (Test-Path -LiteralPath $firmwareOtaDest)) { $missingDeps += "firmware/zephyr.signed.bin" }
 
 Write-Utf8NoBom -Path (Join-Path $depsDir "README_DEPS.txt") -Lines @(
     "This folder is complete when MANIFEST.json has missing_deps=[] and SHA256SUMS.txt verifies successfully.",
@@ -372,6 +411,7 @@ Write-Utf8NoBom -Path (Join-Path $depsDir "README_DEPS.txt") -Lines @(
     "For rebuilds, provide Nordic Command Line Tools installer as deps\nordic-command-line-tools-installer.exe.",
     "Nordic CLI provides nrfjprog and its validated J-Link 7.94e package; do not bundle standalone J-Link V9.56.",
     "For rebuilds, provide the factory merged.hex as firmware\axi_p1_factory_merged.hex."
+    "For rebuilds, provide the signed OTA image as firmware\zephyr.signed.bin."
 )
 
 $manifest = [ordered]@{
@@ -392,6 +432,10 @@ $manifest = [ordered]@{
     nordic_command_line_tools_installer = "deps/nordic-command-line-tools-installer.exe"
     nordic_install_skip_bundled_segger = $false
     default_firmware_hex = "firmware/axi_p1_factory_merged.hex"
+    default_ota_image = "firmware/zephyr.signed.bin"
+    gui_executable = "Axi Factory Workstation.exe"
+    cli_executable = "Axi Factory Workstation CLI.exe"
+    ota_helper_executable = "Axi OTA Helper.exe"
     missing_deps = $missingDeps
     complete_offline = ($missingDeps.Count -eq 0)
     install_entry = "install_offline_win10.cmd"

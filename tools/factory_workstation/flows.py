@@ -31,6 +31,9 @@ class FlowOutcome:
     result: str
     message: str
     results: list[CommandResult]
+    mes_status: str = "SKIPPED"
+    mes_message: str = ""
+    mes_pending_path: str = ""
 
 
 @dataclass
@@ -309,12 +312,10 @@ def run_half_machine(
     start_index: int = 1,
 ) -> FlowOutcome:
     if _missing_required_token(config, sn_enabled, token):
-        record.finish("NG", "missing factory token")
         return FlowOutcome(False, "NG", "missing factory token", [])
     if sn_enabled:
         ok, reason = config.validate_sn(sn)
         if not ok:
-            record.finish("NG", reason)
             return FlowOutcome(False, "NG", reason, [])
     steps = [
         FlowStep("AT probe", "AT"),
@@ -351,7 +352,6 @@ def run_half_machine(
     step_context = StepContext(start_index)
     cap_ok, cap_result = _check_factory_capability(client, record, "half", progress, step_context)
     if not cap_ok:
-        record.finish("NG", "factory AT not available on this firmware")
         return FlowOutcome(False, "NG", "factory AT not available", [cap_result])
     outcome = _run_steps(client, config, steps, progress, record, "half", before_step=before_step, step_context=step_context)
     outcome = _with_factory_lock_cleanup(client, config, record, "half", progress, step_context, outcome)
@@ -362,7 +362,6 @@ def run_half_machine(
             if outcome.result != "PASS":
                 message = f"{outcome.message}; {message}"
             outcome = FlowOutcome(False, "NG", message, outcome.results + [sn_result])
-    record.finish(outcome.result, outcome.message)
     return outcome
 
 
@@ -379,12 +378,10 @@ def run_full_machine(
     start_index: int = 1,
 ) -> FlowOutcome:
     if _missing_required_token(config, sn_enabled, token):
-        record.finish("NG", "missing factory token")
         return FlowOutcome(False, "NG", "missing factory token", [])
     if sn_enabled:
         ok, reason = config.validate_sn(sn)
         if not ok:
-            record.finish("NG", reason)
             return FlowOutcome(False, "NG", reason, [])
     steps = [
         FlowStep("AT probe", "AT"),
@@ -396,17 +393,19 @@ def run_full_machine(
     step_context = StepContext(start_index)
     cap_ok, cap_result = _check_factory_capability(client, record, "full", progress, step_context)
     if not cap_ok:
-        record.finish("NG", "factory AT not available on this firmware")
         return FlowOutcome(False, "NG", "factory AT not available", [cap_result])
     if config.ota_enabled:
         outcome = _run_steps(client, config, steps, progress, record, "full", before_step=before_step, step_context=step_context)
         if not outcome.ok:
-            record.finish(outcome.result, outcome.message)
             return outcome
         ota_outcome = _run_ota_phase(client, config, record, progress, step_context)
         if not ota_outcome.ok:
-            record.finish(ota_outcome.result, f"OTA phase failed: {ota_outcome.message}")
-            return ota_outcome
+            return FlowOutcome(
+                ota_outcome.ok,
+                ota_outcome.result,
+                f"OTA phase failed: {ota_outcome.message}",
+                ota_outcome.results,
+            )
         post_steps = []
         if token:
             post_steps.append(FlowStep("Factory unlock", f"AT+FACTORY=UNLOCK,{token}", config.at_timeouts.unlock_s))
@@ -416,7 +415,6 @@ def run_full_machine(
         post_steps = _filter_optional_steps(post_steps, skip_momo)
         final = _run_steps(client, config, post_steps, progress, record, "full", before_step=before_step, step_context=step_context)
         final = _with_factory_lock_cleanup(client, config, record, "full", progress, step_context, final)
-        record.finish(final.result, final.message)
         return final
     if token:
         steps.append(FlowStep("Factory unlock", f"AT+FACTORY=UNLOCK,{token}", config.at_timeouts.unlock_s))
@@ -426,7 +424,6 @@ def run_full_machine(
     steps = _filter_optional_steps(steps, skip_momo)
     outcome = _run_steps(client, config, steps, progress, record, "full", before_step=before_step, step_context=step_context)
     outcome = _with_factory_lock_cleanup(client, config, record, "full", progress, step_context, outcome)
-    record.finish(outcome.result, outcome.message)
     return outcome
 
 
@@ -487,10 +484,31 @@ def _run_ota_phase(
     progress(idx, "OTA image check", "PASS", f"size={image_path.stat().st_size}")
 
     idx = step_context.take()
-    record.start_step(idx, "OTA disconnect NUS", "close")
-    progress(idx, "OTA disconnect NUS", "RUN", "closing BLE NUS")
+    record.start_step(idx, "OTA disconnect NUS", "AT+RST + close")
+    progress(idx, "OTA disconnect NUS", "RUN", "requesting reboot and closing BLE NUS")
+    reset_result = client.send_command("AT+RST", 4.0)
+    results.append(reset_result)
+    if not reset_result.ok:
+        detail = " ; ".join(reset_result.lines[-3:])
+        record.log_item("full", "OTA disconnect NUS", "AT+RST + close", "NG",
+                        int(reset_result.elapsed_s * 1000), "device did not accept reboot", detail)
+        progress(idx, "OTA disconnect NUS", "NG", detail or "device did not accept reboot")
+        return FlowOutcome(False, "NG", "OTA handoff reboot failed", results)
     client.close()
-    record.log_item("full", "OTA disconnect NUS", "close", "PASS", 0, "", "nus closed for smp upload")
+    closed = client.wait_closed(5.0)
+    record.log_item(
+        "full",
+        "OTA disconnect NUS",
+        "AT+RST + close",
+        "PASS" if closed else "NG",
+        int(reset_result.elapsed_s * 1000),
+        "" if closed else "BLE connection thread did not exit within 5 seconds",
+        "device reboot accepted; nus closed for smp upload" if closed else "close timeout",
+    )
+    if not closed:
+        progress(idx, "OTA disconnect NUS", "NG", "BLE connection thread did not exit within 5 seconds")
+        return FlowOutcome(False, "NG", "OTA BLE connection release timed out", results)
+    progress(idx, "OTA disconnect NUS", "PASS", "device reboot accepted; BLE session closed")
 
     time.sleep(5.0)
 

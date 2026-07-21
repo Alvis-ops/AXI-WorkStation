@@ -16,15 +16,33 @@ class OtaCommand:
 
 
 def _uses_nrf_dongle_backend(config: WorkstationConfig) -> bool:
+    if config.ble_pairing_enabled:
+        return False
     backend = (config.ble_scan_backend or "").strip().lower()
     return backend in {"nrf", "nrf_dongle", "dongle", "pc_ble_driver"}
+
+
+def _bundled_ota_helper(repo: Path) -> Path | None:
+    candidates = (
+        repo / "Axi OTA Helper.exe",
+        Path(sys.executable).resolve().parent / "Axi OTA Helper.exe",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def build_ota_command(config: WorkstationConfig, ble_address: str = "") -> OtaCommand:
     repo = Path(config.firmware_repo)
     image = Path(config.ota_image_path)
-    if _uses_nrf_dongle_backend(config):
-        script = repo / "tools" / "ota_smp_dongle.py"
+    helper = _bundled_ota_helper(repo)
+    dongle_script = repo / "tools" / "ota_smp_dongle.py"
+    if helper is not None:
+        script = helper
+        argv = [str(helper), str(image), "--name", config.ble_name]
+    elif _uses_nrf_dongle_backend(config) and dongle_script.is_file():
+        script = dongle_script
         argv = [
             sys.executable,
             str(script),
@@ -54,6 +72,8 @@ def build_ota_command(config: WorkstationConfig, ble_address: str = "") -> OtaCo
         argv = [sys.executable, str(script), str(image), "--name", config.ble_name]
     if ble_address:
         argv.extend(["--addr", ble_address])
+    if config.ble_pairing_enabled:
+        argv.append("--pair")
     return OtaCommand(argv=argv, cwd=str(repo), script_name=script.name)
 
 

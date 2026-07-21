@@ -17,6 +17,13 @@ APP_BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", F
 FIRMWARE_REPO = TOOLS_DIR.parent.parent / "axi-p1-embeded" if not getattr(sys, "frozen", False) else APP_BASE_DIR
 CONFIG_PATH = (APP_BASE_DIR if getattr(sys, "frozen", False) else PACKAGE_DIR) / "config.json"
 ENV_PATH = (APP_BASE_DIR if getattr(sys, "frozen", False) else PACKAGE_DIR) / ".env"
+_BUNDLED_FLASH_SCRIPT = PACKAGE_DIR / "flash_selected_image.ps1"
+_INSTALLED_FLASH_SCRIPT = APP_BASE_DIR / "flash_selected_image.ps1"
+DEFAULT_FLASH_SCRIPT = (
+    _INSTALLED_FLASH_SCRIPT
+    if getattr(sys, "frozen", False) and _INSTALLED_FLASH_SCRIPT.is_file()
+    else _BUNDLED_FLASH_SCRIPT
+)
 TOUCH_CAPTURE_MIN_TIMEOUT_S = 45.0
 VIBCAPTURE_MIN_TIMEOUT_S = 60.0
 PPG_CAPTURE_MIN_TIMEOUT_S = 45.0
@@ -85,6 +92,7 @@ class ATTimeouts:
 
 @dataclass
 class MesConfig:
+    checkroute_enabled: bool = False
     checkroute_url: str = "http://192.168.3.58/json/J.php/xt/checkroute"
     postxtdata_url: str = "http://192.168.3.58/json/J.php/xt/postxtdata"
     device: str = ""
@@ -93,7 +101,7 @@ class MesConfig:
     full_station: str = "整机测试"
     timeout_s: float = 5.0
     device_field: str = "Device"
-    response_success_field: str = ""
+    response_success_field: str = "res"
     response_success_values: list[str] = field(
         default_factory=lambda: ["1", "true", "ok", "pass", "success"]
     )
@@ -103,7 +111,7 @@ class MesConfig:
         return self.full_station if station_type.strip().upper() == "FULL" else self.half_station
 
     def validate(self, station_type: str = "HALF") -> tuple[bool, str]:
-        if not self.checkroute_url.strip():
+        if self.checkroute_enabled and not self.checkroute_url.strip():
             return False, "MES checkroute_url is empty"
         if not self.postxtdata_url.strip():
             return False, "MES postxtdata_url is empty"
@@ -137,7 +145,7 @@ def redact_sensitive_text(text: str) -> str:
 @dataclass
 class WorkstationConfig:
     firmware_repo: str = str(FIRMWARE_REPO)
-    flash_script_path: str = str(FIRMWARE_REPO / "flash_poc3a.ps1")
+    flash_script_path: str = str(DEFAULT_FLASH_SCRIPT)
     half_flash_before_test: bool = False
     flash_backend: str = "nrfjprog"
     flash_image_path: str = str(FIRMWARE_REPO / "build_ondemand" / "merged.hex")
@@ -154,6 +162,7 @@ class WorkstationConfig:
     ble_name: str = "AXI-P1-T"
     ble_address_whitelist: list[str] = field(default_factory=list)
     ble_scan_backend: str = "nrf_dongle"
+    ble_pairing_enabled: bool = False
     ble_dongle_port: str = "COM8"
     ble_dongle_sd_version: str = "auto"
     nrf_connect_ble_path: str = ""

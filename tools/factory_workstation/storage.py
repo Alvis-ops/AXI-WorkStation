@@ -15,6 +15,8 @@ from .config import redact_sensitive_text
 CSV_FLUSH_EVERY_ROWS = 50
 RAW_LOG_FLUSH_EVERY_LINES = 50
 MAX_STEP_MEASUREMENTS = 32
+MAX_STEP_SAMPLES = 1000
+SAMPLE_KINDS = {"touch_frame", "vib_frame", "ppg_frame"}
 
 TEST_ITEM_KEYS = {
     "Firmware flash": "firmware_flash",
@@ -83,6 +85,9 @@ class RecordedTestItem:
     error_reason: str
     response_summary: str
     measurements: tuple[dict[str, Any], ...] = ()
+    samples: tuple[dict[str, Any], ...] = ()
+    sample_count: int = 0
+    samples_truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -155,6 +160,8 @@ class RunRecord:
         self._step_index = ""
         self._step_name = ""
         self._step_measurements: list[dict[str, Any]] = []
+        self._step_samples: list[dict[str, Any]] = []
+        self._step_sample_count = 0
         self._test_items: list[RecordedTestItem] = []
         self._finished = False
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -208,6 +215,8 @@ class RunRecord:
         self._step_index = str(step_index)
         self._step_name = step_name
         self._step_measurements = []
+        self._step_samples = []
+        self._step_sample_count = 0
         self.log_event(
             "step_start",
             {"step_index": step_index, "step_name": step_name, "command": redact_sensitive_text(command)},
@@ -275,6 +284,9 @@ class RunRecord:
                 error_reason=error_reason,
                 response_summary=response_summary,
                 measurements=tuple(dict(item) for item in self._step_measurements),
+                samples=tuple(dict(item) for item in self._step_samples),
+                sample_count=self._step_sample_count,
+                samples_truncated=self._step_sample_count > len(self._step_samples),
             )
         )
         if self.write_extra_files:
@@ -317,6 +329,8 @@ class RunRecord:
             },
         )
         self._step_measurements = []
+        self._step_samples = []
+        self._step_sample_count = 0
         self.flush_writes()
 
     def run_summary(
@@ -401,9 +415,19 @@ class RunRecord:
 
     def ingest_line(self, line: str) -> None:
         parsed = parse_line(line)
+        if parsed.fields and parsed.kind in SAMPLE_KINDS:
+            self._step_sample_count += 1
+            if len(self._step_samples) < MAX_STEP_SAMPLES:
+                self._step_samples.append(
+                    {
+                        "kind": parsed.kind,
+                        "category": parsed.category,
+                        "fields": dict(parsed.fields),
+                    }
+                )
         if (
             parsed.fields
-            and parsed.kind not in {"empty", "ok", "text", "touch_frame", "vib_frame", "ppg_frame"}
+            and parsed.kind not in {"empty", "ok", "text", *SAMPLE_KINDS}
             and len(self._step_measurements) < MAX_STEP_MEASUREMENTS
         ):
             self._step_measurements.append(

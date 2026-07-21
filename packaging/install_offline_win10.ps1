@@ -16,7 +16,10 @@ param(
 $ErrorActionPreference = "Stop"
 $script:AppName = "Axi Factory Workstation"
 $script:ExeName = "Axi Factory Workstation.exe"
+$script:CliExeName = "Axi Factory Workstation CLI.exe"
+$script:OtaHelperExeName = "Axi OTA Helper.exe"
 $script:FirmwareLeaf = "axi_p1_factory_merged.hex"
+$script:OtaFirmwareLeaf = "zephyr.signed.bin"
 $script:LogPath = Join-Path ([System.IO.Path]::GetTempPath()) "AxiFactoryWorkstation_offline_install.log"
 
 if (-not $PackageRoot) {
@@ -120,6 +123,7 @@ function Set-WorkstationDefaultFirmware {
     param(
         [string]$InstallRoot,
         [string]$FirmwareSource,
+        [string]$OtaFirmwareSource,
         [string]$NrfjprogPath,
         [string]$JLinkDllPath,
         [string]$NrfConnectBlePath
@@ -131,10 +135,17 @@ function Set-WorkstationDefaultFirmware {
     New-Item -ItemType Directory -Path $firmwareTargetDir -Force | Out-Null
     $firmwareTarget = Join-Path $firmwareTargetDir $script:FirmwareLeaf
     Copy-Item -LiteralPath $FirmwareSource -Destination $firmwareTarget -Force
+    if (-not (Test-Path -LiteralPath $OtaFirmwareSource)) {
+        throw "Default OTA image missing: $OtaFirmwareSource"
+    }
+    $otaFirmwareTarget = Join-Path $firmwareTargetDir $script:OtaFirmwareLeaf
+    Copy-Item -LiteralPath $OtaFirmwareSource -Destination $otaFirmwareTarget -Force
 
     $configPath = Join-Path $InstallRoot "config.json"
-    Update-WorkstationFlashConfig -ConfigPath $configPath -PreserveExistingUserSettings -ReplaceMissingFilePathSettings @("flash_image_path", "half_flash_image_path") -Values @{
+    Update-WorkstationFlashConfig -ConfigPath $configPath -PreserveExistingUserSettings -ReplaceMissingFilePathSettings @("firmware_repo", "flash_script_path", "flash_image_path", "half_flash_image_path", "ota_image_path") -Values @{
         half_flash_before_test = $false
+        firmware_repo = "."
+        flash_script_path = "flash_selected_image.ps1"
         flash_backend = "nrfjprog"
         flash_image_path = "firmware\$($script:FirmwareLeaf)"
         half_flash_image_path = "firmware\$($script:FirmwareLeaf)"
@@ -145,8 +156,9 @@ function Set-WorkstationDefaultFirmware {
         jlink_dll_path = $JLinkDllPath
         record_output_mode = "unified"
         nrf_connect_ble_path = $NrfConnectBlePath
+        ota_image_path = "firmware\$($script:OtaFirmwareLeaf)"
     }
-    Write-OfflineLog "Configured default firmware and flash settings: $firmwareTarget"
+    Write-OfflineLog "Configured default flash and OTA images: $firmwareTarget ; $otaFirmwareTarget"
 }
 
 function Test-InstalledTools {
@@ -154,6 +166,7 @@ function Test-InstalledTools {
         [string]$InstallRoot,
         [string]$NrfConnectBlePath,
         [string]$FirmwarePath,
+        [string]$OtaFirmwarePath,
         [string]$NrfjprogPath,
         [string]$JLinkDllPath
     )
@@ -165,10 +178,14 @@ function Test-InstalledTools {
 
     if (-not (Test-Path -LiteralPath $FirmwarePath)) { throw "Default firmware hex missing after install: $FirmwarePath" }
     Write-OfflineLog "Default firmware found: $FirmwarePath"
+    if (-not (Test-Path -LiteralPath $OtaFirmwarePath)) { throw "Default OTA image missing after install: $OtaFirmwarePath" }
+    Write-OfflineLog "Default OTA image found: $OtaFirmwarePath"
 
-    $exePath = Join-Path $InstallRoot $script:ExeName
-    if (-not (Test-Path -LiteralPath $exePath)) { throw "Workstation exe missing after install: $exePath" }
-    Write-OfflineLog "Workstation exe found: $exePath"
+    foreach ($exeName in @($script:ExeName, $script:CliExeName, $script:OtaHelperExeName)) {
+        $exePath = Join-Path $InstallRoot $exeName
+        if (-not (Test-Path -LiteralPath $exePath)) { throw "Workstation executable missing after install: $exePath" }
+        Write-OfflineLog "Workstation executable found: $exePath"
+    }
 }
 
 function Find-SetupExe {
@@ -230,10 +247,12 @@ try {
     }
 
     $installedFirmware = Join-Path $InstallRoot ("firmware\{0}" -f $script:FirmwareLeaf)
+    $installedOtaFirmware = Join-Path $InstallRoot ("firmware\{0}" -f $script:OtaFirmwareLeaf)
     if (-not $SkipFirmware) {
         Set-WorkstationDefaultFirmware `
             -InstallRoot $InstallRoot `
             -FirmwareSource (Join-Path $PackageRoot ("firmware\{0}" -f $script:FirmwareLeaf)) `
+            -OtaFirmwareSource (Join-Path $PackageRoot ("firmware\{0}" -f $script:OtaFirmwareLeaf)) `
             -NrfjprogPath $nrfjprogPath `
             -JLinkDllPath $(if ($jlinkInstallation) { $jlinkInstallation.DllPath } else { $preferredJLinkDll }) `
             -NrfConnectBlePath $targetBle
@@ -245,6 +264,7 @@ try {
             -InstallRoot $InstallRoot `
             -NrfConnectBlePath $targetBle `
             -FirmwarePath $installedFirmware `
+            -OtaFirmwarePath $installedOtaFirmware `
             -NrfjprogPath $nrfjprogPath `
             -JLinkDllPath $finalJLinkDll
     }

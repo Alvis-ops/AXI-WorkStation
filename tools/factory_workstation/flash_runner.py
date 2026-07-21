@@ -15,6 +15,7 @@ from .config import WorkstationConfig
 FlashLogCallback = Callable[[str, str], None]
 JLINK_ERROR_256 = "JLinkARM.dll reported error -256"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+SELECTED_IMAGE_FLASH_SCRIPT_NAME = "flash_selected_image.ps1"
 
 
 def _to_text(value: object) -> str:
@@ -107,6 +108,11 @@ def _jlink_dll_args(config: WorkstationConfig, *, require_file: bool = True) -> 
     return ["--jdll", dll_path]
 
 
+def is_selected_image_flash_script(path_text: str) -> bool:
+    """Return whether the script follows the workstation selected-image contract."""
+    return Path(str(path_text or "").strip()).name.casefold() == SELECTED_IMAGE_FLASH_SCRIPT_NAME.casefold()
+
+
 def build_flash_command(config: WorkstationConfig, *, probe_id_override: str = "") -> FlashCommand:
     backend = str(config.flash_backend or "nrfjprog").strip().lower()
     env = os.environ.copy()
@@ -135,11 +141,22 @@ def build_flash_command(config: WorkstationConfig, *, probe_id_override: str = "
 
     if backend == "script":
         script = _require_file(config.flash_script_path, "flash script")
+        selected_image_script = is_selected_image_flash_script(str(script))
         image_hash = ""
         image_path = ""
-        if config.flash_image_path and Path(config.flash_image_path).exists():
+        if selected_image_script:
+            image = _require_file(config.flash_image_path, "flash image")
+            image_path = str(image)
+            image_hash = file_sha256(image_path)
+        elif config.flash_image_path and Path(config.flash_image_path).is_file():
             image_path = str(Path(config.flash_image_path))
             image_hash = file_sha256(image_path)
+        tool = str(config.nrfjprog_path or "nrfjprog").strip() or "nrfjprog"
+        dll_path = str(config.jlink_dll_path or "").strip()
+        env["AXI_FLASH_IMAGE_PATH"] = str(config.flash_image_path or "")
+        env["AXI_FLASH_NRFJPROG_PATH"] = tool
+        env["AXI_FLASH_JLINK_DLL_PATH"] = dll_path
+        env["AXI_FLASH_VERIFY"] = "1" if config.flash_verify else "0"
         if probe_id:
             env["POC3A_JLINK_ID"] = probe_id
         argv = [
@@ -150,6 +167,22 @@ def build_flash_command(config: WorkstationConfig, *, probe_id_override: str = "
             "-File",
             str(script),
         ]
+        if selected_image_script:
+            dll_path = _jlink_dll_args(config)[1]
+            argv.extend(
+                [
+                    "-ImagePath",
+                    image_path,
+                    "-NrfjprogPath",
+                    tool,
+                    "-JLinkDllPath",
+                    dll_path,
+                ]
+            )
+            if probe_id:
+                argv.extend(["-ProbeId", probe_id])
+            if not config.flash_verify:
+                argv.append("-NoVerify")
         return FlashCommand(
             backend=backend,
             argv=argv,

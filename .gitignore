@@ -9,6 +9,13 @@ build/
 *.spec.bak
 factory_records/
 bare_board_records/
+*.exe
+*.msi
+*.zip
+*.hex
+*.bin
+*.log
+*.tmp
 
 # Python
 __pycache__/
@@ -17,6 +24,10 @@ __pycache__/
 .venv/
 venv/
 .env
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
 
 # IDE / OS
 .vscode/
@@ -24,3 +35,4 @@ venv/
 *.swp
 Thumbs.db
 Desktop.ini
+.DS_Store

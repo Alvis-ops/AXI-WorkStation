@@ -12,7 +12,9 @@ import sys
 import tempfile
 import threading
 import warnings
+from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable
 
 
@@ -157,6 +159,7 @@ class FakeBleTransport(ScriptedTransport):
         "AT+CAP?": ["+CAP:factory_prod=1", "OK"],
         "AT+OTABUSY?": ["+OTABUSY:locked=0", "OK"],
         "AT+OTA?": ["+OTA:locked=0,state=idle", "OK"],
+        "AT+RST": ["+RST:delay_ms=200", "OK"],
         "AT+FACTORY=UNLOCK,TOKEN": ["OK"],
         TOUCH_CAPTURE_CMD: ["+HW:TOUCH:FRAME:0,0,0x02,0x00000000,0x00000001,100/101/102/103,1/2/3/4,90/91/92/93,80/81/82/83", "+HW:TOUCH:CAPTURE:samples=60", "OK"],
         VIB_CAPTURE_CMD: ["+HW:IMU:VIBF:0,20,12,-3,998,1,0,-1,50", "+HW:IMU:VIBSUMMARY:samples=150,duration_ms=3000,interval_ms=20,elapsed_ms=3020,overruns=0,max_late_ms=0,status=PASS", "OK"],
@@ -500,7 +503,7 @@ def test_sn_enabled_missing_token_still_fails() -> None:
     _assert(outcome.result == "NG", f"expected NG, got {outcome.result}")
     _assert(outcome.message == "missing factory token", f"unexpected message: {outcome.message}")
     _assert(not transport.commands, "formal mode sent commands after missing token")
-    _assert(record.finished == ("NG", "missing factory token"), "record did not finish missing token")
+    _assert(record.finished is None, "flow layer unexpectedly closed the missing-token record")
 
 
 def test_sn_persistence_failure_marks_half_ng() -> None:
@@ -520,7 +523,7 @@ def test_sn_persistence_failure_marks_half_ng() -> None:
 
     _assert(outcome.result == "NG", f"expected NG from SN persistence failure, got {outcome.result}")
     _assert(outcome.message == "SN persistence check failed", f"unexpected SN persistence message: {outcome.message}")
-    _assert(record.finished == ("NG", "SN persistence check failed"), "record finish did not fail SN persistence")
+    _assert(record.finished is None, "flow layer unexpectedly closed the SN-persistence record")
     sn_items = [item for item in record.items if item[1] == "SN persistence check"]
     _assert(sn_items and sn_items[-1][3] == "NG", "SN persistence item was not NG")
 
@@ -828,11 +831,28 @@ def _run_cli_with_responses(
     if fake_flash_ok is None and not flash_flags.intersection(cli_args):
         cli_args.append("--no-flash-before-test")
 
-    exit_code = cli.run(
-        cli_args,
-        transport_factory=factory,
-        flash_runner=fake_flash if fake_flash_ok is not None else None,
+    original_start_mes_run = cli.start_mes_run
+    original_complete_mes_run = cli.complete_mes_run
+    cli.start_mes_run = lambda *_args, **_kwargs: SimpleNamespace(  # type: ignore[assignment]
+        confirmed=True,
+        process_started_at=datetime.now(),
+        message="smoke MES route confirmed",
+        route_checked=False,
     )
+    cli.complete_mes_run = lambda *_args, **_kwargs: SimpleNamespace(  # type: ignore[assignment]
+        status=cli.MES_CONFIRMED,
+        message="smoke MES result confirmed",
+        pending_path="",
+    )
+    try:
+        exit_code = cli.run(
+            cli_args,
+            transport_factory=factory,
+            flash_runner=fake_flash if fake_flash_ok is not None else None,
+        )
+    finally:
+        cli.start_mes_run = original_start_mes_run  # type: ignore[assignment]
+        cli.complete_mes_run = original_complete_mes_run  # type: ignore[assignment]
     commands = [cmd for transport in ScriptedTransport.created for cmd in transport.commands]
     if flash_calls_out is not None:
         flash_calls_out.extend(flash_calls)
@@ -857,6 +877,8 @@ def test_cli_half_full_sn_modes() -> None:
                 "--token",
                 "TOKEN",
                 "--sn-record",
+                "--record-output-mode",
+                "unified",
             ],
             _half_success_responses(),
         )
@@ -927,6 +949,8 @@ def test_cli_half_full_sn_modes() -> None:
                 "TOKEN",
                 "--sn-record",
                 "--no-ota",
+                "--record-output-mode",
+                "unified",
             ],
             _full_success_responses(),
         )
@@ -955,6 +979,8 @@ def test_cli_half_full_sn_modes() -> None:
                 "TOKEN",
                 "--sn-record",
                 "--no-ota",
+                "--record-output-mode",
+                "unified",
             ],
             _full_success_responses(),
         )
@@ -1272,6 +1298,141 @@ def test_jlink_scan_autofill_and_script_env() -> None:
         ui_mod.save_config = original_save_config  # type: ignore[assignment]
 
 
+def test_selected_image_flash_script_contract() -> None:
+    selected_script = Path(__file__).with_name("flash_selected_image.ps1")
+    _assert(selected_script.is_file(), "selected-image flash script is missing")
+    with tempfile.TemporaryDirectory() as tmp:
+        image = Path(tmp) / "operator-selected.hex"
+        image.write_text(":00000001FF\n", encoding="ascii")
+        dll = Path(tmp) / "JLink_x64.dll"
+        dll.write_bytes(b"mock")
+        config = WorkstationConfig(
+            flash_backend="script",
+            flash_script_path=str(selected_script),
+            flash_image_path=str(image),
+            nrfjprog_path="mock-nrfjprog.exe",
+            jlink_dll_path=str(dll),
+            jlink_probe_id="69730336",
+            flash_verify=False,
+        )
+
+        command = flash_runner.build_flash_command(config)
+        _assert(command.image_path == str(image), "selected script did not retain the operator-selected image")
+        _assert(command.image_sha256 == flash_runner.file_sha256(image), "selected image hash was not recorded")
+        _assert(command.env.get("AXI_FLASH_IMAGE_PATH") == str(image), "selected image was not exported to script env")
+        _assert(command.env.get("AXI_FLASH_NRFJPROG_PATH") == "mock-nrfjprog.exe", "nrfjprog path was not exported")
+        _assert(command.env.get("AXI_FLASH_JLINK_DLL_PATH") == str(dll), "J-Link DLL was not exported")
+        _assert(command.env.get("AXI_FLASH_VERIFY") == "0", "verify choice was not exported")
+        _assert(command.env.get("POC3A_JLINK_ID") == "69730336", "probe ID was not exported")
+        _assert(command.argv[command.argv.index("-ImagePath") + 1] == str(image), "selected image argument is wrong")
+        _assert(command.argv[command.argv.index("-NrfjprogPath") + 1] == "mock-nrfjprog.exe", "tool argument is wrong")
+        _assert(command.argv[command.argv.index("-JLinkDllPath") + 1] == str(dll), "DLL argument is wrong")
+        _assert(command.argv[command.argv.index("-ProbeId") + 1] == "69730336", "probe argument is wrong")
+        _assert("-NoVerify" in command.argv, "disabled verification was not passed to selected-image script")
+
+        legacy_script = Path(tmp) / "legacy_flash.ps1"
+        legacy_script.write_text("exit 0\n", encoding="utf-8")
+        config.flash_script_path = str(legacy_script)
+        legacy_command = flash_runner.build_flash_command(config)
+        _assert("-ImagePath" not in legacy_command.argv, "legacy custom script received incompatible arguments")
+        _assert(legacy_command.env.get("AXI_FLASH_IMAGE_PATH") == str(image), "legacy script cannot opt into selected-image env")
+
+        config.flash_script_path = str(selected_script)
+        config.flash_image_path = str(Path(tmp) / "missing.hex")
+        try:
+            flash_runner.build_flash_command(config)
+        except FileNotFoundError:
+            pass
+        else:
+            raise AssertionError("selected-image script accepted a missing image")
+
+
+def test_at_client_suppresses_repeated_numeric_noise() -> None:
+    class NoiseTransport:
+        def __init__(self) -> None:
+            self.lines = ["0002"] * 20 + ["OK"]
+
+        def clear_input(self) -> None:
+            pass
+
+        def write_line(self, _command: str) -> None:
+            pass
+
+        def read_line(self, _timeout_s: float) -> str | None:
+            return self.lines.pop(0) if self.lines else None
+
+        def close(self) -> None:
+            pass
+
+    emitted: list[tuple[str, str]] = []
+    result = ATClient(NoiseTransport(), lambda direction, line: emitted.append((direction, line))).send_command("AT", 1.0)
+    _assert(result.ok, "AT did not recover after repeated numeric boot noise")
+    _assert(result.ignored_lines == 20, "numeric boot noise was not counted as ignored")
+    _assert(emitted.count(("RX", "0002")) == 1, "repeated numeric boot noise flooded the callback")
+    _assert(("RX", "OK") in emitted, "valid AT response was suppressed with boot noise")
+
+
+def test_ui_flash_reconnect_retries_with_fresh_client() -> None:
+    from factory_workstation import ui_main as ui_mod
+
+    original_probe = ui_mod.probe_at_client
+    original_sleep = ui_mod.time.sleep
+
+    class FakeVar:
+        def get(self) -> str:
+            return "UART"
+
+    class FakeClient:
+        def __init__(self, attempt: int) -> None:
+            self.attempt = attempt
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+        def wait_closed(self, _timeout_s: float) -> bool:
+            return True
+
+    class FakeRecord:
+        def __init__(self) -> None:
+            self.starts: list[tuple] = []
+            self.items: list[tuple] = []
+
+        def start_step(self, *args) -> None:
+            self.starts.append(args)
+
+        def log_item(self, *args) -> None:
+            self.items.append(args)
+
+    clients = [FakeClient(1), FakeClient(2), FakeClient(3)]
+    app = object.__new__(ui_mod.WorkstationApp)
+    app.transport_var = FakeVar()
+    app.events = queue.Queue()
+    app.client = None
+    app._make_client_from_current_settings = lambda _line_cb: (clients.pop(0), "UART", "COM21@460800")
+    record = FakeRecord()
+    progress_events: list[tuple] = []
+
+    def fake_probe(client):
+        if client.attempt < 3:
+            return False, 50, "", f"attempt {client.attempt} not ready", []
+        return True, 50, "+VER:test ; OK", "", []
+
+    ui_mod.probe_at_client = fake_probe  # type: ignore[assignment]
+    ui_mod.time.sleep = lambda _seconds: None  # type: ignore[assignment]
+    try:
+        selected = app._reconnect_after_flash(record, lambda *_args: None, lambda *args: progress_events.append(args))
+    finally:
+        ui_mod.probe_at_client = original_probe  # type: ignore[assignment]
+        ui_mod.time.sleep = original_sleep  # type: ignore[assignment]
+
+    _assert(selected is not None and selected.attempt == 3, "flash reconnect did not reach the successful retry")
+    _assert(app.client is selected, "successful reconnect client was not installed")
+    _assert(record.starts == [(2, "Flash reconnect", "AT;AT+VER?")], "reconnect step was not started explicitly")
+    _assert(record.items and record.items[-1][3] == "PASS", "successful retry was not recorded as PASS")
+    _assert(progress_events[-1][2] == "PASS", "reconnect progress did not end in PASS")
+
+
 def test_flash_runner_timeout_and_jlink_noise() -> None:
     original_popen = flash_runner.subprocess.Popen
     original_tool = flash_runner._run_nrfjprog_tool
@@ -1421,7 +1582,7 @@ def test_same_hash_ota_is_pending() -> None:
     all_commands = [cmd for transport in ScriptedTransport.created for cmd in transport.commands]
     _assert(outcome.result == "PENDING-HW", f"expected PENDING-HW, got {outcome.result}")
     _assert(not any(cmd.startswith("AT+FACTORY=UNLOCK") for cmd in all_commands), "same-hash OTA continued into factory unlock")
-    _assert(record.finished is not None and record.finished[0] == "PENDING-HW", "record finish did not preserve PENDING-HW")
+    _assert(record.finished is None, "flow layer unexpectedly closed the same-hash OTA record")
 
 
 def test_real_ota_requires_busy_clear_after_reconnect() -> None:
@@ -1468,6 +1629,9 @@ def test_ota_command_uses_dongle_backend() -> None:
         image = repo / "build_ondemand" / "dfu_application.zip"
         image.parent.mkdir(parents=True, exist_ok=True)
         image.write_bytes(b"smoke")
+        dongle_script = repo / "tools" / "ota_smp_dongle.py"
+        dongle_script.parent.mkdir(parents=True, exist_ok=True)
+        dongle_script.write_text("# smoke\n", encoding="utf-8")
         config = WorkstationConfig(
             firmware_repo=str(repo),
             ota_image_path=str(image),
@@ -1486,8 +1650,16 @@ def test_ota_command_uses_dongle_backend() -> None:
         _assert("C8:B9:CA:AC:85:74" in command.argv, "BLE address missing from OTA command")
 
         config.ble_scan_backend = "windows"
+        config.ble_pairing_enabled = True
         command = ota_runner.build_ota_command(config, "C8:B9:CA:AC:85:74")
         _assert(command.script_name == "ota_smp_ble.py", f"windows backend script {command.script_name}")
+        _assert("--pair" in command.argv, "pairing flag missing from Windows OTA command")
+
+        bundled_helper = repo / "Axi OTA Helper.exe"
+        bundled_helper.write_bytes(b"MZ")
+        command = ota_runner.build_ota_command(config, "C8:B9:CA:AC:85:74")
+        _assert(command.script_name == "Axi OTA Helper.exe", f"bundled helper not selected {command.script_name}")
+        _assert(command.argv[0] == str(bundled_helper), "bundled OTA helper executable is not argv[0]")
 
 
 def test_ble_close_is_idempotent_without_loop() -> None:
@@ -1520,6 +1692,80 @@ def test_dongle_backend_requires_address() -> None:
     except Exception:
         raised = False
     _assert(raised, "nRF dongle backend did not require a BLE address")
+
+
+def test_dongle_backend_rejects_pairing() -> None:
+    raised = False
+    try:
+        transport_ble.BLENusTransport(
+            "AXI-P1-T",
+            "C8:B9:CA:AC:85:74",
+            backend="nrf_dongle",
+            pair=True,
+        )
+    except RuntimeError as exc:
+        raised = "Windows BLE backend" in str(exc)
+    except Exception:
+        raised = False
+    _assert(raised, "nRF dongle backend silently accepted host pairing")
+
+
+def test_windows_ble_pairing_requests_authenticated_link() -> None:
+    import bleak
+
+    seen: dict[str, object] = {}
+
+    class FakeBleakClient:
+        def __init__(self, target, **kwargs) -> None:
+            seen["target"] = target
+            seen["init"] = kwargs
+            self.is_connected = True
+
+        async def connect(self, **kwargs) -> None:
+            seen["connect"] = kwargs
+
+        async def start_notify(self, uuid, _callback) -> None:
+            seen["notify"] = uuid
+
+        async def disconnect(self) -> None:
+            self.is_connected = False
+
+    async def fake_scan(_name: str, _timeout: float) -> list[transport_ble.BLEDeviceInfo]:
+        return [
+            transport_ble.BLEDeviceInfo(
+                "AXI-P1-T",
+                "E3:A9:F3:49:97:A7",
+                device="fake-device",
+            )
+        ]
+
+    async def exercise() -> None:
+        item = object.__new__(transport_ble.BLENusTransport)
+        item.name = "AXI-P1-T"
+        item.address = "E3:A9:F3:49:97:A7"
+        item.scan_timeout_s = 8.0
+        item._pair = True
+        item._client = None
+        item._rx = bytearray()
+        await item._connect_main()
+
+    original_client = bleak.BleakClient
+    original_scan = transport_ble._scan_ble_async
+    bleak.BleakClient = FakeBleakClient  # type: ignore[assignment]
+    transport_ble._scan_ble_async = fake_scan  # type: ignore[assignment]
+    try:
+        asyncio.run(exercise())
+    finally:
+        bleak.BleakClient = original_client  # type: ignore[assignment]
+        transport_ble._scan_ble_async = original_scan  # type: ignore[assignment]
+
+    init_kwargs = seen.get("init", {})
+    connect_kwargs = seen.get("connect", {})
+    _assert(isinstance(init_kwargs, dict) and init_kwargs.get("pair") is True, "Bleak pair flag missing")
+    _assert(
+        isinstance(connect_kwargs, dict) and connect_kwargs.get("protection_level") == 3,
+        "Windows BLE did not request encryption+authentication",
+    )
 
 
 def test_dongle_kwargs_property_and_close() -> None:
@@ -1603,6 +1849,193 @@ def test_ui_log_batch_op_filter_and_poll_split() -> None:
     _assert(app._ui_metrics["control_events"] >= 2, "control events should be counted")
 
 
+def test_ui_confirmed_mes_upload_popup_is_explicit() -> None:
+    from factory_workstation import ui_main as ui_mod
+
+    app = object.__new__(ui_mod.WorkstationApp)
+    app.sn_var = SimpleNamespace(get=lambda: "SN-MES-001")
+    app.sn_enabled_var = SimpleNamespace(get=lambda: True)
+
+    calls: list[tuple[str, str, str]] = []
+    original_showinfo = ui_mod.messagebox.showinfo
+    ui_mod.messagebox.showinfo = lambda title, message: calls.append(("info", title, message))  # type: ignore[assignment]
+    try:
+        app._show_flow_done_popup(
+            flows.FlowOutcome(
+                True,
+                "PASS",
+                "all steps passed",
+                [],
+                mes_status=ui_mod.MES_CONFIRMED,
+                mes_message="postxtdata confirmed: res='OK'",
+            )
+        )
+    finally:
+        ui_mod.messagebox.showinfo = original_showinfo  # type: ignore[assignment]
+
+    _assert(len(calls) == 1, f"expected one success popup, got {calls}")
+    _assert("MES 上传成功" in calls[0][1], f"popup title does not confirm MES upload: {calls[0]}")
+    _assert("MES 数据上传成功" in calls[0][2], f"popup body does not confirm MES upload: {calls[0]}")
+
+
+def test_ui_ota_releases_existing_connection_before_subprocess() -> None:
+    from factory_workstation import ui_main as ui_mod
+
+    order: list[str] = []
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self._transport = object.__new__(transport_ble.BLENusTransport)
+            self._transport.address = "E3:A9:F3:49:97:A7"
+
+        def send_command(self, command: str, _timeout_s: float):
+            _assert(command == "AT+RST", f"unexpected OTA handoff command: {command}")
+            order.append("reset")
+            return SimpleNamespace(ok=True)
+
+        def close(self) -> None:
+            order.append("close")
+
+        def wait_closed(self, _timeout_s: float) -> bool:
+            order.append("wait_closed")
+            return True
+
+    with tempfile.TemporaryDirectory() as tmp:
+        image = Path(tmp) / "zephyr.signed.bin"
+        image.write_bytes(b"smoke")
+        app = object.__new__(ui_mod.WorkstationApp)
+        app.busy = False
+        app.client = FakeClient()
+        app.config_model = WorkstationConfig(
+            firmware_repo=tmp,
+            ota_image_path=str(image),
+            ble_scan_backend="windows",
+        )
+        app.ble_addr_var = SimpleNamespace(get=lambda: "E3:A9:F3:49:97:A7")
+        app.events = queue.Queue()
+        app._save_settings = lambda silent=False: None  # type: ignore[method-assign]
+        app._set_busy = lambda _value: None  # type: ignore[method-assign]
+        app._set_connection_status = lambda *_args: None  # type: ignore[method-assign]
+
+        run_started = threading.Event()
+        original_askyesno = ui_mod.messagebox.askyesno
+        original_run_ota = ui_mod.run_ota
+        original_wait_s = ui_mod.OTA_BLE_RELEASE_WAIT_S
+
+        def fake_run_ota(_config, _address, _line_callback) -> int:
+            order.append("run_ota")
+            run_started.set()
+            return 0
+
+        ui_mod.messagebox.askyesno = lambda *_args, **_kwargs: True  # type: ignore[assignment]
+        ui_mod.run_ota = fake_run_ota  # type: ignore[assignment]
+        ui_mod.OTA_BLE_RELEASE_WAIT_S = 0.0
+        try:
+            app._run_ota()
+            _assert(run_started.wait(2.0), "OTA worker did not start")
+        finally:
+            ui_mod.messagebox.askyesno = original_askyesno  # type: ignore[assignment]
+            ui_mod.run_ota = original_run_ota  # type: ignore[assignment]
+            ui_mod.OTA_BLE_RELEASE_WAIT_S = original_wait_s
+
+    _assert(app.client is None, "GUI kept the existing BLE client during OTA")
+    _assert(
+        order == ["reset", "close", "wait_closed", "run_ota"],
+        f"OTA connection release order is wrong: {order}",
+    )
+
+
+def test_cli_standalone_ota_handoff_and_preview() -> None:
+    order: list[str] = []
+
+    class FakeClient:
+        def send_command(self, command: str, _timeout_s: float):
+            _assert(command == "AT+RST", f"unexpected standalone OTA command: {command}")
+            order.append("reset")
+            return SimpleNamespace(ok=True, lines=["+RST:delay_ms=200", "OK"])
+
+        def close(self) -> None:
+            order.append("close")
+
+        def wait_closed(self, _timeout_s: float) -> bool:
+            order.append("wait_closed")
+            return True
+
+    with tempfile.TemporaryDirectory() as tmp:
+        image = Path(tmp) / "zephyr.signed.bin"
+        image.write_bytes(b"smoke")
+        config = WorkstationConfig(
+            firmware_repo=tmp,
+            ota_image_path=str(image),
+            ble_name="AXI-P1-T",
+        )
+        args = SimpleNamespace(
+            ble_address="E3:A9:F3:49:97:A7",
+            ble_backend="bleak",
+            ota_dry_run=False,
+            ota_handoff=True,
+            ota_skip_handoff=False,
+            verbose_frames=False,
+        )
+
+        def factory(_config, _args, _line_callback):
+            order.append("connect")
+            return FakeClient()
+
+        def fake_ota(_config, _address, _line_callback) -> int:
+            order.append("run_ota")
+            return 0
+
+        original_wait_s = cli.OTA_CLI_HANDOFF_WAIT_S
+        cli.OTA_CLI_HANDOFF_WAIT_S = 0.0
+        try:
+            code = cli._run_ota_command(  # type: ignore[attr-defined]
+                config,
+                args,
+                transport_factory=factory,
+                ota_runner=fake_ota,
+            )
+        finally:
+            cli.OTA_CLI_HANDOFF_WAIT_S = original_wait_s
+
+        _assert(code == 0, f"standalone OTA CLI returned {code}")
+        _assert(
+            order == ["connect", "reset", "close", "wait_closed", "run_ota"],
+            f"standalone OTA CLI order is wrong: {order}",
+        )
+
+        args.ota_dry_run = True
+        preview_factory_called = False
+
+        def preview_factory(_config, _args, _line_callback):
+            nonlocal preview_factory_called
+            preview_factory_called = True
+            raise AssertionError("OTA preview opened a transport")
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            preview_code = cli._run_ota_command(  # type: ignore[attr-defined]
+                config,
+                args,
+                transport_factory=preview_factory,
+                ota_runner=fake_ota,
+            )
+        _assert(preview_code == 0, f"standalone OTA preview returned {preview_code}")
+        _assert(not preview_factory_called, "OTA preview connected to hardware")
+
+        args.ota_dry_run = False
+        args.ota_handoff = False
+        order.clear()
+        direct_code = cli._run_ota_command(  # type: ignore[attr-defined]
+            config,
+            args,
+            transport_factory=preview_factory,
+            ota_runner=fake_ota,
+        )
+        _assert(direct_code == 0, f"direct standalone OTA returned {direct_code}")
+        _assert(order == ["run_ota"], f"direct standalone OTA unexpectedly used NUS handoff: {order}")
+        _assert(not preview_factory_called, "direct standalone OTA opened a NUS transport")
+
+
 def main() -> int:
     tests = [
         test_half_sn_record_check_requires_half_pass,
@@ -1623,11 +2056,17 @@ def main() -> int:
         test_compact_parser_and_unified_log,
         test_split_record_output_writes_compatibility_files,
         test_ui_log_batch_op_filter_and_poll_split,
+        test_ui_confirmed_mes_upload_popup_is_explicit,
+        test_ui_ota_releases_existing_connection_before_subprocess,
+        test_cli_standalone_ota_handoff_and_preview,
         test_cli_half_full_sn_modes,
         test_cli_half_flash_before_test,
         test_cli_half_flash_reconnect_failure_stops_flow,
         test_flash_precheck_multi_probe_policy,
         test_jlink_scan_autofill_and_script_env,
+        test_selected_image_flash_script_contract,
+        test_at_client_suppresses_repeated_numeric_noise,
+        test_ui_flash_reconnect_retries_with_fresh_client,
         test_flash_runner_timeout_and_jlink_noise,
         test_cli_frame_output_filtering,
         test_ota_command_uses_dongle_backend,
@@ -1635,6 +2074,8 @@ def main() -> int:
         test_real_ota_requires_busy_clear_after_reconnect,
         test_ble_close_is_idempotent_without_loop,
         test_dongle_backend_requires_address,
+        test_dongle_backend_rejects_pairing,
+        test_windows_ble_pairing_requests_authenticated_link,
         test_dongle_kwargs_property_and_close,
     ]
     for test in tests:

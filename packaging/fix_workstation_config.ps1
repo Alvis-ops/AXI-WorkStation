@@ -11,7 +11,7 @@ $cfg = Join-Path $InstallRoot "config.json"
 $content = @"
 {
   "firmware_repo": ".",
-  "flash_script_path": "",
+  "flash_script_path": "flash_selected_image.ps1",
   "half_flash_before_test": false,
   "flash_backend": "nrfjprog",
   "flash_image_path": "firmware\\axi_p1_factory_merged.hex",

@@ -17,7 +17,18 @@ if __package__ in (None, ""):
     from factory_workstation.flash_flow import probe_at_client, record_flash_step
     from factory_workstation.flash_runner import FlashOutcome, run_flash
     from factory_workstation.flows import FlowOutcome, run_full_machine, run_half_machine
-    from factory_workstation.mes_service import MesService, build_sample_post_payload, write_pending_request
+    from factory_workstation.mes_service import (
+        MES_CONFIRMED,
+        MES_SKIPPED,
+        MES_UNCONFIRMED,
+        MesRunStart,
+        MesService,
+        build_sample_post_payload,
+        complete_mes_run,
+        start_mes_run,
+        write_pending_request,
+    )
+    from factory_workstation.ota_runner import build_ota_command, run_ota
     from factory_workstation.storage import NullRunRecord, RunStorage, verify_half_sn_pass_record
     from factory_workstation.transport_ble import BLENusTransport
     from factory_workstation.transport_uart import UARTTransport
@@ -28,7 +39,18 @@ else:
     from .flash_flow import probe_at_client, record_flash_step
     from .flash_runner import FlashOutcome, run_flash
     from .flows import FlowOutcome, run_full_machine, run_half_machine
-    from .mes_service import MesService, build_sample_post_payload, write_pending_request
+    from .mes_service import (
+        MES_CONFIRMED,
+        MES_SKIPPED,
+        MES_UNCONFIRMED,
+        MesRunStart,
+        MesService,
+        build_sample_post_payload,
+        complete_mes_run,
+        start_mes_run,
+        write_pending_request,
+    )
+    from .ota_runner import build_ota_command, run_ota
     from .storage import NullRunRecord, RunStorage, verify_half_sn_pass_record
     from .transport_ble import BLENusTransport
     from .transport_uart import UARTTransport
@@ -36,13 +58,15 @@ else:
 
 TransportFactory = Callable[[WorkstationConfig, argparse.Namespace, Callable[[str, str], None]], ATClient]
 FlashRunner = Callable[[WorkstationConfig, Callable[[str, str], None] | None], FlashOutcome]
+OtaRunner = Callable[[WorkstationConfig, str, Callable[[str, str], None]], int]
+OTA_CLI_HANDOFF_WAIT_S = 5.0
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="POC3A factory workstation CLI")
     parser.add_argument(
         "flow",
-        choices=("half", "full", "mes-checkroute", "mes-post"),
+        choices=("half", "full", "ota", "mes-checkroute", "mes-post"),
         help="factory flow or MES diagnostic command",
     )
     parser.add_argument("--config", default=str(CONFIG_PATH), help="config JSON path")
@@ -59,12 +83,40 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--dongle-port", default="COM8", help="nRF Dongle CDC port for the nrf_dongle backend")
     parser.add_argument("--ble-scan-timeout", type=float, default=8.0, help="BLE scan timeout seconds")
+    pairing_group = parser.add_mutually_exclusive_group()
+    pairing_group.add_argument(
+        "--ble-pair",
+        action="store_true",
+        help="request authenticated Windows BLE pairing before GATT access",
+    )
+    pairing_group.add_argument(
+        "--no-ble-pair",
+        action="store_true",
+        help="disable BLE pairing even when enabled in config.json",
+    )
     parser.add_argument("--sn", default="", help="DUT serial number")
     parser.add_argument("--token", default="", help="factory unlock token; env/.env is used when omitted")
     parser.add_argument("--records-root", help="record output root")
     parser.add_argument("--dut-alias", help="DUT alias written to records")
     parser.add_argument("--ota", action="store_true", help="enable OTA phase for full flow")
     parser.add_argument("--no-ota", action="store_true", help="disable OTA phase for full flow")
+    parser.add_argument("--ota-image", help="signed .bin or DFU package used by the standalone OTA command")
+    parser.add_argument(
+        "--ota-dry-run",
+        action="store_true",
+        help="preview the standalone OTA helper command without connecting or uploading",
+    )
+    ota_handoff_group = parser.add_mutually_exclusive_group()
+    ota_handoff_group.add_argument(
+        "--ota-handoff",
+        action="store_true",
+        help="connect over NUS and request AT+RST before starting standalone OTA",
+    )
+    ota_handoff_group.add_argument(
+        "--ota-skip-handoff",
+        action="store_true",
+        help="deprecated compatibility flag; standalone OTA already starts directly by default",
+    )
     parser.add_argument("--skip-momo", action="store_true", help="skip MOMO touch steps for temporary host/device bring-up")
     parser.add_argument(
         "--capture-output-mode",
@@ -135,6 +187,10 @@ def _apply_overrides(config: WorkstationConfig, args: argparse.Namespace) -> tup
         config.ble_name = args.ble_name
     if args.ble_address:
         config.ble_address_whitelist = [args.ble_address]
+    if args.ble_pair:
+        config.ble_pairing_enabled = True
+    if args.no_ble_pair:
+        config.ble_pairing_enabled = False
     if args.records_root:
         config.records_root = args.records_root
     if args.dut_alias is not None:
@@ -143,6 +199,8 @@ def _apply_overrides(config: WorkstationConfig, args: argparse.Namespace) -> tup
         config.ota_enabled = True
     if args.no_ota:
         config.ota_enabled = False
+    if args.ota_image:
+        config.ota_image_path = args.ota_image
     if args.capture_output_mode:
         config.capture_output_mode = args.capture_output_mode
     if args.record_output_mode:
@@ -186,11 +244,13 @@ def _default_transport_factory(
     mode = config.prefer_transport.upper()
     if mode == "BLE":
         address = args.ble_address or (config.ble_address_whitelist[0] if config.ble_address_whitelist else "")
+        backend = "bleak" if config.ble_pairing_enabled else args.ble_backend
         transport = BLENusTransport(
             config.ble_name or "AXI-P1-T",
             address,
             args.ble_scan_timeout,
-            backend=args.ble_backend,
+            backend=backend,
+            pair=config.ble_pairing_enabled,
             dongle_port=args.dongle_port,
         )
         return ATClient(transport, line_callback)
@@ -211,11 +271,72 @@ def _progress(index: int, label: str, status: str, detail: str) -> None:
 
 
 def _exit_code(outcome: FlowOutcome) -> int:
+    if outcome.mes_status == MES_UNCONFIRMED:
+        return 3
     if outcome.ok:
         return 0
     if outcome.result == "PENDING-HW":
         return 4
     return 2
+
+
+def _with_mes_result(outcome: FlowOutcome, status: str, message: str, pending_path: str = "") -> FlowOutcome:
+    return replace(
+        outcome,
+        mes_status=status,
+        mes_message=message,
+        mes_pending_path=pending_path,
+    )
+
+
+def _finalize_run(
+    config: WorkstationConfig,
+    record,
+    *,
+    station_type: str,
+    sn_enabled: bool,
+    mes_start: MesRunStart | None,
+    outcome: FlowOutcome,
+) -> FlowOutcome:
+    if not sn_enabled:
+        finalized = _with_mes_result(outcome, MES_SKIPPED, "dry-run: MES skipped")
+    elif mes_start is None or mes_start.process_started_at is None:
+        finalized = _with_mes_result(outcome, MES_UNCONFIRMED, "MES result upload was not initialized")
+    else:
+        completion = complete_mes_run(
+            config.mes,
+            record,
+            records_root=config.records_root,
+            station_type=station_type,
+            process_started_at=mes_start.process_started_at,
+            device_result=outcome.result,
+            device_message=outcome.message,
+        )
+        finalized = _with_mes_result(
+            outcome,
+            completion.status,
+            completion.message,
+            completion.pending_path,
+        )
+    record.finish(
+        finalized.result,
+        finalized.message,
+        mes_status=finalized.mes_status,
+        mes_details=finalized.mes_message,
+        mes_pending_path=finalized.mes_pending_path,
+    )
+    return finalized
+
+
+def _print_final_result(outcome: FlowOutcome) -> None:
+    print(f"[DEVICE] {outcome.result} {outcome.message}", flush=True)
+    if outcome.mes_status == MES_CONFIRMED:
+        print(f"[MES] CONFIRMED {outcome.mes_message}", flush=True)
+    elif outcome.mes_status == MES_UNCONFIRMED:
+        pending = f" pending={outcome.mes_pending_path}" if outcome.mes_pending_path else ""
+        print(f"[MES] UNCONFIRMED {outcome.mes_message}{pending}", flush=True)
+    else:
+        print(f"[MES] SKIPPED {outcome.mes_message}", flush=True)
 
 
 def _run_flash_step(
@@ -299,23 +420,111 @@ def _run_mes_command(config: WorkstationConfig, args: argparse.Namespace) -> int
     return 0 if result.confirmed else 3
 
 
+def _run_ota_command(
+    config: WorkstationConfig,
+    args: argparse.Namespace,
+    *,
+    transport_factory: TransportFactory,
+    ota_runner: OtaRunner,
+) -> int:
+    address = str(args.ble_address or "").strip()
+    image = Path(config.ota_image_path)
+    if not image.exists():
+        raise ValueError(f"OTA image not found: {image}")
+
+    config.prefer_transport = "BLE"
+    config.ble_scan_backend = "windows" if args.ble_backend == "bleak" else "nrf_dongle"
+    if address:
+        config.ble_address_whitelist = [address]
+
+    command = build_ota_command(config, address)
+    if args.ota_dry_run:
+        _print_json(
+            {
+                "operation": "ota-preview",
+                "backend": config.ble_scan_backend,
+                "address": address,
+                "image": str(image),
+                "handoff": bool(args.ota_handoff and not args.ota_skip_handoff),
+                "command": command.argv,
+                "cwd": command.cwd,
+            }
+        )
+        return 0
+
+    if not address:
+        raise ValueError("standalone OTA requires --ble-address unless --ota-dry-run is used")
+
+    client: ATClient | None = None
+    if args.ota_handoff and not args.ota_skip_handoff:
+        print(f"[INFO] OTA handoff: connect BLE target {address}", flush=True)
+        client = transport_factory(config, args, _line_callback)
+        try:
+            reset_result = client.send_command("AT+RST", 4.0)
+            if not reset_result.ok:
+                detail = " ; ".join(reset_result.lines[-3:])
+                print(f"[RESULT] NG OTA handoff reboot failed: {detail}", flush=True)
+                return 2
+            print("[OK] device accepted AT+RST", flush=True)
+        finally:
+            client.close()
+        if not client.wait_closed(5.0):
+            print("[RESULT] NG OTA BLE connection release timed out", flush=True)
+            return 2
+        print(f"[INFO] waiting {OTA_CLI_HANDOFF_WAIT_S:.1f}s for BLE advertising", flush=True)
+        time.sleep(OTA_CLI_HANDOFF_WAIT_S)
+
+    ota_lines: list[str] = []
+
+    def ota_log(direction: str, line: str) -> None:
+        ota_lines.append(line)
+        _line_callback(direction, line, args.verbose_frames)
+
+    code = ota_runner(config, address, ota_log)
+    output = "\n".join(ota_lines).lower()
+    same_hash = "matches the active image" in output or "same image hash" in output
+    if code == 0:
+        print("[RESULT] PASS OTA completed", flush=True)
+        return 0
+    if same_hash:
+        print("[RESULT] PENDING-HW OTA link verified but image hash matches active firmware", flush=True)
+        return 4
+    print(f"[RESULT] NG OTA helper exit code={code}", flush=True)
+    return 2
+
+
 def run(
     argv: list[str] | None = None,
     transport_factory: TransportFactory | None = None,
     flash_runner: FlashRunner | None = None,
+    ota_runner: OtaRunner | None = None,
 ) -> int:
     args = _parse_args(argv)
     config = load_config(Path(args.config))
     mode, sn_enabled = _apply_overrides(config, args)
+    factory = transport_factory or _default_transport_factory
     if args.flow.startswith("mes-"):
         try:
             return _run_mes_command(config, args)
         except Exception as exc:
             print(f"[ERR] {exc}", flush=True)
             return 1
+    if args.flow == "ota":
+        try:
+            return _run_ota_command(
+                config,
+                args,
+                transport_factory=factory,
+                ota_runner=ota_runner or run_ota,
+            )
+        except KeyboardInterrupt:
+            print("[ERR] interrupted", flush=True)
+            return 130
+        except Exception as exc:
+            print(f"[ERR] {exc}", flush=True)
+            return 1
     sn = args.sn.strip() if sn_enabled else ""
     token = get_factory_token(args.token)
-    factory = transport_factory or _default_transport_factory
     flash_runner_impl = flash_runner or run_flash
 
     print(
@@ -333,6 +542,15 @@ def run(
         if not token:
             print("[INFO] 空跑模式：未填 token，将跳过 Factory unlock/lock", flush=True)
 
+    if sn_enabled:
+        ok, reason = config.validate_sn(sn)
+        if not ok:
+            print(f"[RESULT] NG {reason}", flush=True)
+            return 2
+        if config.factory_at_required and not token:
+            print("[RESULT] NG missing factory token", flush=True)
+            return 2
+
     if sn_enabled and args.flow == "full":
         half_sn_check = verify_half_sn_pass_record(config.records_root, sn)
         if not half_sn_check.ok:
@@ -344,13 +562,41 @@ def run(
     client: ATClient | None = None
     flash_before_half = args.flow == "half" and config.half_flash_before_test
     flow_start_index = 1
+    station_type = "HALF" if args.flow == "half" else "FULL"
+    mes_start: MesRunStart | None = None
     try:
         if sn_enabled:
-            station = "HALF" if args.flow == "half" else "FULL"
             record = RunStorage(
                 config.records_root,
                 write_extra_files=config.write_extra_record_files(),
-            ).start_run(station, sn, config.dut_alias)
+            ).start_run(station_type, sn, config.dut_alias)
+            mes_start = start_mes_run(
+                config.mes,
+                record,
+                sn=sn,
+                station_type=station_type,
+            )
+            if not mes_start.confirmed:
+                record.finish(
+                    "MES_UNCONFIRMED",
+                    mes_start.message,
+                    mes_status=MES_UNCONFIRMED,
+                    mes_details=mes_start.message,
+                )
+                outcome = FlowOutcome(
+                    False,
+                    "MES_UNCONFIRMED",
+                    "MES configuration or pre-test check failed; device test did not start",
+                    [],
+                    MES_UNCONFIRMED,
+                    mes_start.message,
+                )
+                _print_final_result(outcome)
+                return 3
+            if mes_start.route_checked:
+                print(f"[MES] checkroute CONFIRMED {mes_start.message}", flush=True)
+            else:
+                print("[MES] checkroute SKIPPED; result will be uploaded after the test", flush=True)
         else:
             record = NullRunRecord()
 
@@ -360,9 +606,16 @@ def run(
             # Operators can use the GUI "烧录检测" button when they want it.
             outcome = _run_flash_step(flash_config, record, _progress, flash_runner_impl)
             if not outcome.ok:
-                record.finish("NG", f"flash failed: {outcome.message}")
-                print(f"[RESULT] NG flash failed: {outcome.message}", flush=True)
-                return 2
+                finalized = _finalize_run(
+                    config,
+                    record,
+                    station_type=station_type,
+                    sn_enabled=sn_enabled,
+                    mes_start=mes_start,
+                    outcome=FlowOutcome(False, "NG", f"flash failed: {outcome.message}", []),
+                )
+                _print_final_result(finalized)
+                return _exit_code(finalized)
             wait_s = max(0.0, float(config.flash_after_wait_s))
             if wait_s > 0:
                 print(f"[INFO] waiting {wait_s:.1f}s after flash", flush=True)
@@ -385,9 +638,16 @@ def run(
             record.log_item("half", "Flash reconnect", "AT;AT+VER?", "PASS" if ok else "NG", elapsed_ms, reason, detail)
             _progress(2, "Flash reconnect", "PASS" if ok else "NG", detail or f"{elapsed_ms / 1000:.1f}s")
             if not ok:
-                record.finish("NG", "flash reconnect failed")
-                print("[RESULT] NG flash reconnect failed", flush=True)
-                return 2
+                finalized = _finalize_run(
+                    config,
+                    record,
+                    station_type=station_type,
+                    sn_enabled=sn_enabled,
+                    mes_start=mes_start,
+                    outcome=FlowOutcome(False, "NG", "flash reconnect failed", []),
+                )
+                _print_final_result(finalized)
+                return _exit_code(finalized)
         if args.flow == "half":
             outcome = run_half_machine(
                 client,
@@ -412,17 +672,53 @@ def run(
                 skip_momo=args.skip_momo,
                 start_index=flow_start_index,
             )
-        print(f"[RESULT] {outcome.result} {outcome.message}", flush=True)
-        return _exit_code(outcome)
+        finalized = _finalize_run(
+            config,
+            record,
+            station_type=station_type,
+            sn_enabled=sn_enabled,
+            mes_start=mes_start,
+            outcome=outcome,
+        )
+        _print_final_result(finalized)
+        return _exit_code(finalized)
     except KeyboardInterrupt:
+        if record is not None:
+            try:
+                interrupted = _finalize_run(
+                    config,
+                    record,
+                    station_type=station_type,
+                    sn_enabled=sn_enabled,
+                    mes_start=mes_start,
+                    outcome=FlowOutcome(False, "NG", "interrupted by operator", []),
+                )
+                _print_final_result(interrupted)
+            except Exception:
+                pass
         print("[ERR] interrupted", flush=True)
         return 130
     except Exception as exc:
+        exception_outcome: FlowOutcome | None = None
         if record is not None:
             try:
-                record.finish("NG", str(exc))
+                exception_outcome = _finalize_run(
+                    config,
+                    record,
+                    station_type=station_type,
+                    sn_enabled=sn_enabled,
+                    mes_start=mes_start,
+                    outcome=FlowOutcome(False, "NG", str(exc), []),
+                )
             except Exception:
-                pass
+                try:
+                    record.finish("NG", str(exc))
+                except Exception:
+                    pass
+        if exception_outcome is not None:
+            _print_final_result(exception_outcome)
+            if exception_outcome.mes_status == MES_UNCONFIRMED:
+                return 3
         print(f"[ERR] {exc}", flush=True)
         return 1
     finally:

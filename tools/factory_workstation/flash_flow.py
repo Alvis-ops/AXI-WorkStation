@@ -7,7 +7,7 @@ from typing import Callable
 
 from .at_client import ATClient, CommandResult
 from .config import WorkstationConfig
-from .flash_runner import FlashOutcome, detect_jlink_probes
+from .flash_runner import FlashOutcome, detect_jlink_probes, is_selected_image_flash_script
 
 
 FlashRunner = Callable[[WorkstationConfig, Callable[[str, str], None] | None], FlashOutcome]
@@ -58,7 +58,10 @@ def precheck_flash_request(config: WorkstationConfig, *, sn_enabled: bool, dry_r
             return FlashPrecheckResult(False, "ERR", f"flash script not found: {script}")
         if not script.is_file():
             return FlashPrecheckResult(False, "ERR", f"flash script is not a file: {script}")
-    elif backend == "nrfjprog":
+    elif backend != "nrfjprog":
+        return FlashPrecheckResult(False, "ERR", f"unsupported flash backend: {backend}")
+
+    if backend == "nrfjprog" or is_selected_image_flash_script(config.flash_script_path):
         image_text = str(config.flash_image_path or "").strip()
         if not image_text:
             return FlashPrecheckResult(False, "ERR", "flash image is empty")
@@ -67,8 +70,6 @@ def precheck_flash_request(config: WorkstationConfig, *, sn_enabled: bool, dry_r
             return FlashPrecheckResult(False, "ERR", f"flash image not found: {image}")
         if not image.is_file():
             return FlashPrecheckResult(False, "ERR", f"flash image is not a file: {image}")
-    else:
-        return FlashPrecheckResult(False, "ERR", f"unsupported flash backend: {backend}")
 
     # SN recording does not affect probe safety. Every flash requires a
     # configured SNR or exactly one detected probe.

@@ -1,6 +1,6 @@
 {
   "firmware_repo": "..\\..\\..\\axi-p1-embeded",
-  "flash_script_path": "",
+  "flash_script_path": "flash_selected_image.ps1",
   "half_flash_before_test": false,
   "flash_backend": "nrfjprog",
   "flash_image_path": "..\\..\\..\\axi-p1-embeded\\build_ondemand\\merged.hex",
@@ -17,6 +17,7 @@
   "ble_name": "AXI-P1-T",
   "ble_address_whitelist": [],
   "ble_scan_backend": "nrf_dongle",
+  "ble_pairing_enabled": false,
   "ble_dongle_port": "COM8",
   "ble_dongle_sd_version": "auto",
   "nrf_connect_ble_path": "",
@@ -47,6 +48,7 @@
     "ota_s": 300.0
   },
   "mes": {
+    "checkroute_enabled": false,
     "checkroute_url": "http://192.168.3.58/json/J.php/xt/checkroute",
     "postxtdata_url": "http://192.168.3.58/json/J.php/xt/postxtdata",
     "device": "",
@@ -55,7 +57,7 @@
     "full_station": "整机测试",
     "timeout_s": 5.0,
     "device_field": "Device",
-    "response_success_field": "",
+    "response_success_field": "res",
     "response_success_values": [
       "1",
       "true",

@@ -24,8 +24,23 @@ from .config import (
     verify_engineer_password,
 )
 from .flash_flow import flash_payload, precheck_flash_request, probe_at_client, record_flash_step
-from .flash_runner import FlashOutcome, JLinkDetectResult, file_sha256, run_flash, scan_jlink_probes
+from .flash_runner import (
+    FlashOutcome,
+    JLinkDetectResult,
+    file_sha256,
+    is_selected_image_flash_script,
+    run_flash,
+    scan_jlink_probes,
+)
 from .flows import FlowOutcome, run_full_machine, run_half_machine
+from .mes_service import (
+    MES_CONFIRMED,
+    MES_SKIPPED,
+    MES_UNCONFIRMED,
+    MesRunStart,
+    complete_mes_run,
+    start_mes_run,
+)
 from .ota_runner import build_ota_command, run_ota
 from .storage import NullRunRecord, RunStorage, verify_half_sn_pass_record
 from .transport_ble import BLEDeviceInfo, BLENusTransport, scan_ble_devices
@@ -37,6 +52,7 @@ UI_LOG_MAX_LINES = 900
 # Resize fires many Configure events; settle before relayout to keep drag smooth.
 UI_RESIZE_SETTLE_MS = 120
 UI_STEP_STATUS_REFRESH_MS = 16
+OTA_BLE_RELEASE_WAIT_S = 5.0
 UI_CONTROL_EVENT_KINDS = frozenset(
     {
         "busy",
@@ -47,6 +63,7 @@ UI_CONTROL_EVENT_KINDS = frozenset(
         "operator_prompt",
         "popup",
         "flow_done",
+        "mes_status",
         "ble_devices",
         "jlink_scan_result",
     }
@@ -522,6 +539,7 @@ class WorkstationApp(ttk.Window):
         self.ble_name_var = tk.StringVar(value=cfg.ble_name)
         self.ble_addr_var = tk.StringVar(value=cfg.ble_address_whitelist[0] if cfg.ble_address_whitelist else "")
         self.ble_scan_backend_var = tk.StringVar(value=cfg.ble_scan_backend or "nrf_dongle")
+        self.ble_pairing_enabled_var = tk.BooleanVar(value=cfg.ble_pairing_enabled)
         self.ble_dongle_port_var = tk.StringVar(value=cfg.ble_dongle_port or "COM8")
         self.ble_dongle_sd_var = tk.StringVar(value=cfg.ble_dongle_sd_version or "auto")
         self.nrf_connect_ble_path_var = tk.StringVar(value=cfg.nrf_connect_ble_path)
@@ -551,6 +569,17 @@ class WorkstationApp(ttk.Window):
         self.sn_max_var = tk.StringVar(value=str(cfg.sn_rule.max_len))
         self.sn_prefix_var = tk.StringVar(value=cfg.sn_rule.prefix)
         self.sn_regex_var = tk.StringVar(value=cfg.sn_rule.regex)
+        self.mes_status_var = tk.StringVar(value="MES：等待测试")
+        self.mes_checkroute_enabled_var = tk.BooleanVar(value=cfg.mes.checkroute_enabled)
+        self.mes_checkroute_url_var = tk.StringVar(value=cfg.mes.checkroute_url)
+        self.mes_postxtdata_url_var = tk.StringVar(value=cfg.mes.postxtdata_url)
+        self.mes_device_var = tk.StringVar(value=cfg.mes.device)
+        self.mes_line_var = tk.StringVar(value=cfg.mes.line)
+        self.mes_half_station_var = tk.StringVar(value=cfg.mes.half_station)
+        self.mes_full_station_var = tk.StringVar(value=cfg.mes.full_station)
+        self.mes_timeout_var = tk.StringVar(value=str(cfg.mes.timeout_s))
+        self.mes_success_field_var = tk.StringVar(value=cfg.mes.response_success_field)
+        self.mes_http_2xx_var = tk.BooleanVar(value=cfg.mes.http_2xx_is_success)
 
     def _build_style(self) -> None:
         style = ttk.Style()
@@ -713,23 +742,53 @@ class WorkstationApp(ttk.Window):
             sticky=tk.W,
             pady=(4, 0),
         )
-
-        ttk.Separator(frame).grid(row=12, column=0, columnspan=2, sticky=tk.EW, pady=12)
-        ttk.Label(frame, text="工程调试", style="Title.TLabel").grid(row=13, column=0, columnspan=2, sticky=tk.W, pady=(0, 8))
-        self.manual_cmd_var = tk.StringVar(value="AT")
-        self.manual_entry = ttk.Entry(frame, textvariable=self.manual_cmd_var)
-        self.manual_entry.grid(row=14, column=0, columnspan=2, sticky=tk.EW, pady=3)
-        self.manual_send_btn = ttk.Button(frame, text="发送 AT", bootstyle="primary", command=self._send_manual)
-        self.manual_send_btn.grid(row=15, column=0, sticky=tk.EW, pady=3)
-        self.probe_btn = ttk.Button(frame, text="探测 AT/VER", bootstyle="secondary", command=self._probe)
-        self.probe_btn.grid(row=15, column=1, sticky=tk.EW, padx=(6, 0), pady=3)
-        ttk.Label(frame, textvariable=self.manual_hint_var, wraplength=300, foreground="#6B7280").grid(
-            row=16,
+        ttk.Label(frame, textvariable=self.mes_status_var, wraplength=300, foreground="#2563EB").grid(
+            row=12,
             column=0,
             columnspan=2,
             sticky=tk.W,
             pady=(4, 0),
         )
+
+        ttk.Separator(frame).grid(row=13, column=0, columnspan=2, sticky=tk.EW, pady=12)
+        ttk.Label(frame, text="工程调试", style="Title.TLabel").grid(row=14, column=0, columnspan=2, sticky=tk.W, pady=(0, 8))
+        self.manual_cmd_var = tk.StringVar(value="AT")
+        self.manual_entry = ttk.Entry(frame, textvariable=self.manual_cmd_var)
+        self.manual_entry.grid(row=15, column=0, columnspan=2, sticky=tk.EW, pady=3)
+        self.manual_send_btn = ttk.Button(frame, text="发送 AT", bootstyle="primary", command=self._send_manual)
+        self.manual_send_btn.grid(row=16, column=0, sticky=tk.EW, pady=3)
+        self.probe_btn = ttk.Button(frame, text="探测 AT/VER", bootstyle="secondary", command=self._probe)
+        self.probe_btn.grid(row=16, column=1, sticky=tk.EW, padx=(6, 0), pady=3)
+        ttk.Label(frame, textvariable=self.manual_hint_var, wraplength=300, foreground="#6B7280").grid(
+            row=17,
+            column=0,
+            columnspan=2,
+            sticky=tk.W,
+            pady=(4, 0),
+        )
+        lra_shortcuts = ttk.Frame(frame)
+        lra_shortcuts.grid(row=18, column=0, columnspan=2, sticky=tk.EW, pady=(8, 0))
+        for column, (label, command) in enumerate(
+            (
+                ("LRA 状态", "AT+LRAREL?"),
+                ("LRA A 组", "AT+LRAREL=START,A,CONFIRM"),
+                ("LRA B 组", "AT+LRAREL=START,B,CONFIRM"),
+                ("LRA 停止", "AT+LRAREL=STOP"),
+            )
+        ):
+            ttk.Button(
+                lra_shortcuts,
+                text=label,
+                bootstyle="warning" if "组" in label else "secondary",
+                command=lambda value=command: self.manual_cmd_var.set(value),
+            ).grid(row=0, column=column, sticky=tk.EW, padx=(0 if column == 0 else 4, 0))
+            lra_shortcuts.columnconfigure(column, weight=1)
+        ttk.Label(
+            frame,
+            text="警告：A/B 按钮只填入命令，不会自动发送。长测启动前必须确认治具、供电、散热、监控和急停。",
+            wraplength=300,
+            foreground="#B45309",
+        ).grid(row=19, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
         frame.columnconfigure(1, weight=1)
         self._sync_sn_controls()
 
@@ -828,6 +887,20 @@ class WorkstationApp(ttk.Window):
         ).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(tools, text="扫描", bootstyle="info", command=self._scan_ble).pack(side=tk.LEFT)
         ttk.Button(tools, text="使用选中", bootstyle="light", command=self._use_selected_ble).pack(side=tk.LEFT, padx=(6, 0))
+        pairing_row = ttk.Frame(frame)
+        pairing_row.pack(fill=tk.X, pady=(0, 8))
+        ttk.Checkbutton(
+            pairing_row,
+            text="BLE 认证/配对（Windows）",
+            variable=self.ble_pairing_enabled_var,
+            command=self._on_ble_pairing_toggle,
+            bootstyle="round-toggle",
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            pairing_row,
+            text="用于需要加密认证的固件；首次连接可能弹出 Windows 配对确认",
+            foreground="#6B7280",
+        ).pack(side=tk.LEFT, padx=(8, 0))
         self.ble_tree = ttk.Treeview(frame, columns=("name", "address", "rssi", "source"), show="headings", height=12)
         self.ble_tree.heading("name", text="Name")
         self.ble_tree.heading("address", text="Address")
@@ -857,6 +930,14 @@ class WorkstationApp(ttk.Window):
             ("SN 最大", self.sn_max_var, None, None),
             ("SN 前缀", self.sn_prefix_var, None, None),
             ("SN 正则", self.sn_regex_var, None, None),
+            ("MES 路由接口", self.mes_checkroute_url_var, None, "mes_checkroute_url"),
+            ("MES 结果接口", self.mes_postxtdata_url_var, None, "mes_postxtdata_url"),
+            ("MES 设备", self.mes_device_var, None, "mes_device"),
+            ("MES 线体", self.mes_line_var, None, "mes_line"),
+            ("MES 半机工位", self.mes_half_station_var, None, "mes_half_station"),
+            ("MES 整机工位", self.mes_full_station_var, None, "mes_full_station"),
+            ("MES 超时(s)", self.mes_timeout_var, None, "mes_timeout"),
+            ("MES 成功字段", self.mes_success_field_var, None, "mes_success_field"),
         ]
         for row, (label, var, browse, control_name) in enumerate(rows):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky=tk.W, pady=3)
@@ -909,7 +990,35 @@ class WorkstationApp(ttk.Window):
         )
         self.settings_flash_verify_check.grid(row=flash_option_row + 1, column=0, columnspan=2, sticky=tk.W, pady=(2, 8))
         self.settings_engineering_controls.append(self.settings_flash_verify_check)
-        record_row = flash_option_row + 2
+        self.settings_mes_http_2xx_check = ttk.Checkbutton(
+            frame,
+            text="MES HTTP 2xx 即业务成功",
+            variable=self.mes_http_2xx_var,
+            bootstyle="round-toggle",
+        )
+        self.settings_mes_http_2xx_check.grid(
+            row=flash_option_row + 2,
+            column=0,
+            columnspan=2,
+            sticky=tk.W,
+            pady=(2, 8),
+        )
+        self.settings_engineering_controls.append(self.settings_mes_http_2xx_check)
+        self.settings_mes_checkroute_check = ttk.Checkbutton(
+            frame,
+            text="测试前执行 MES checkroute",
+            variable=self.mes_checkroute_enabled_var,
+            bootstyle="round-toggle",
+        )
+        self.settings_mes_checkroute_check.grid(
+            row=flash_option_row + 3,
+            column=0,
+            columnspan=2,
+            sticky=tk.W,
+            pady=(2, 8),
+        )
+        self.settings_engineering_controls.append(self.settings_mes_checkroute_check)
+        record_row = flash_option_row + 4
         ttk.Label(frame, text="记录格式").grid(row=record_row, column=0, sticky=tk.W, pady=3)
         ttk.Combobox(
             frame,
@@ -984,6 +1093,7 @@ class WorkstationApp(ttk.Window):
 1. 连接设备
    - UART：选择 COM 口和波特率（默认 460800），点击"连接"
    - BLE：输入 BLE 广播名（默认 AXI-P1-T）和地址，点击"连接"
+   - 需要认证的固件：在"BLE 扫描"中打开"BLE 认证/配对（Windows）"，首次连接确认 Windows 配对提示
    - 连接成功后状态栏显示"已连接"
 
 2. 工厂测试
@@ -1000,6 +1110,7 @@ class WorkstationApp(ttk.Window):
 
 4. OTA 升级
    - 在"设置"中选择 OTA 包路径
+   - 固件要求认证时，先打开"BLE 认证/配对（Windows）"
    - 点击"OTA 升级"按钮
    - 确认弹窗后开始升级
 
@@ -1219,16 +1330,23 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
         self._set_busy(True)
         threading.Thread(target=self._connect_worker, daemon=True).start()
 
+    def _on_ble_pairing_toggle(self) -> None:
+        if self.ble_pairing_enabled_var.get():
+            self.ble_scan_backend_var.set("windows")
+            self._log("INFO", "已启用 BLE 认证/配对；扫描、连接和 OTA 将使用 Windows 蓝牙")
+
     def _make_client_from_current_settings(self, line_callback) -> tuple[ATClient, str, str]:
         mode = self.transport_var.get().upper()
         if mode == "BLE":
             ble_name = self.ble_name_var.get().strip() or "AXI-P1-T"
             ble_addr = self.ble_addr_var.get().strip()
-            backend = self.ble_scan_backend_var.get().strip() or "nrf_dongle"
+            pairing_enabled = self.ble_pairing_enabled_var.get()
+            backend = "windows" if pairing_enabled else (self.ble_scan_backend_var.get().strip() or "nrf_dongle")
             transport = BLENusTransport(
                 ble_name,
                 ble_addr,
                 backend=backend,
+                pair=pairing_enabled,
                 dongle_port=self.ble_dongle_port_var.get().strip() or "COM8",
                 nrf_connect_ble_path=self.nrf_connect_ble_path_var.get().strip(),
                 dongle_sd_version=self.ble_dongle_sd_var.get().strip() or "auto",
@@ -1249,7 +1367,13 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
             client, mode, label = self._make_client_from_current_settings(self._line_callback)
             self.events.put(("connected", client, mode, label))
         except Exception as exc:
-            self.events.put(("log", "ERR", f"连接失败: {exc}"))
+            detail = str(exc)
+            if "Insufficient Authentication" in detail:
+                if self.ble_pairing_enabled_var.get():
+                    detail += "；配对未完成，请确认 Windows 配对提示，必要时先在 Windows 中删除旧配对后重试"
+                else:
+                    detail += "；请打开“BLE 认证/配对（Windows）”开关后重试"
+            self.events.put(("log", "ERR", f"连接失败: {detail}"))
             self.events.put(("connection_status", "DISCONNECTED", "未连接"))
         finally:
             self.events.put(("busy", False))
@@ -1323,6 +1447,13 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
             if not script or not Path(script).exists():
                 messagebox.showerror("烧录脚本不存在", f"找不到烧录脚本：\n{script}")
                 return False
+            if is_selected_image_flash_script(script):
+                if not image:
+                    messagebox.showerror(f"缺少{image_label}", f"请先在设置中选择{image_label} merged.hex。")
+                    return False
+                if not Path(image).is_file():
+                    messagebox.showerror(f"{image_label}不存在", f"找不到{image_label}：\n{image}")
+                    return False
         else:
             messagebox.showerror("烧录方式无效", f"不支持的烧录方式：{backend}")
             return False
@@ -1459,6 +1590,8 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
         if client is not None:
             try:
                 client.close()
+                if not client.wait_closed(2.0):
+                    self.events.put(("log", "WARN", "烧录前连接未在 2 秒内完全关闭"))
             except Exception as exc:
                 self.events.put(("log", "WARN", f"烧录前关闭连接失败: {exc}"))
         self.events.put(("connection_status", "DISCONNECTED", "烧录期间断开"))
@@ -1480,27 +1613,41 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
         label = "Flash reconnect"
         progress(2, label, "RUN", self.transport_var.get().upper() or "UART")
         started = time.monotonic()
-        try:
-            client, mode, detail = self._make_client_from_current_settings(line_cb)
-            self.client = client
-            self.events.put(("connected", client, mode, detail))
-            ok, elapsed_ms, summary, reason, _results = probe_at_client(client)
-            record.log_item(
-                "half",
-                label,
-                "AT;AT+VER?",
-                "PASS" if ok else "NG",
-                elapsed_ms,
-                reason,
-                summary,
-            )
-            progress(2, label, "PASS" if ok else "NG", summary or f"{elapsed_ms / 1000:.1f}s")
-            return client if ok else None
-        except Exception as exc:
-            elapsed_ms = int((time.monotonic() - started) * 1000)
-            record.log_item("half", label, "connect", "NG", elapsed_ms, str(exc), "")
-            progress(2, label, "NG", str(exc))
-            return None
+        attempts = 3
+        last_reason = "reconnect failed"
+        last_summary = ""
+        record.start_step(2, label, "AT;AT+VER?")
+        for attempt in range(1, attempts + 1):
+            client: ATClient | None = None
+            try:
+                self.events.put(("log", "INFO", f"烧录后重连尝试 {attempt}/{attempts}"))
+                client, mode, detail = self._make_client_from_current_settings(line_cb)
+                ok, _elapsed_ms, summary, reason, _results = probe_at_client(client)
+                last_summary = summary
+                last_reason = reason or "AT probe failed"
+                if ok:
+                    elapsed_ms = int((time.monotonic() - started) * 1000)
+                    self.client = client
+                    self.events.put(("connected", client, mode, detail))
+                    record.log_item("half", label, "AT;AT+VER?", "PASS", elapsed_ms, "", summary)
+                    progress(2, label, "PASS", summary or f"{elapsed_ms / 1000:.1f}s")
+                    return client
+            except Exception as exc:
+                last_reason = str(exc)
+            if client is not None:
+                try:
+                    client.close()
+                    client.wait_closed(1.0)
+                except Exception:
+                    pass
+            if attempt < attempts:
+                self.events.put(("log", "WARN", f"烧录后重连未就绪：{last_reason}；1 秒后重试"))
+                time.sleep(1.0)
+
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        record.log_item("half", label, "AT;AT+VER?", "NG", elapsed_ms, last_reason, last_summary)
+        progress(2, label, "NG", last_reason)
+        return None
 
     def _runtime_token_for_flow(self) -> str:
         return get_factory_token("")
@@ -1709,6 +1856,12 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
     def _sync_sn_controls(self) -> None:
         if hasattr(self, "sn_entry"):
             self.sn_entry.configure(state=tk.NORMAL if self.sn_enabled_var.get() else tk.DISABLED)
+        if hasattr(self, "mes_status_var"):
+            if self.sn_enabled_var.get():
+                route_text = "测试前校验路由，" if self.mes_checkroute_enabled_var.get() else "暂不校验路由，"
+                self.mes_status_var.set(f"MES：正式模式已启用，{route_text}结束后上传结果")
+            else:
+                self.mes_status_var.set("MES：空跑模式跳过")
 
     def _run_commands(self, steps: list[tuple[str, str]]) -> None:
         if not self._ensure_client() or self.busy:
@@ -1792,10 +1945,59 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
         self.active_flow_sn = sn
         threading.Thread(target=self._flow_worker, args=(kind, sn, token, sn_enabled), daemon=True).start()
 
+    def _finalize_flow_record(
+        self,
+        record,
+        *,
+        station_type: str,
+        sn_enabled: bool,
+        mes_start: MesRunStart | None,
+        outcome: FlowOutcome,
+    ) -> FlowOutcome:
+        if not sn_enabled:
+            finalized = replace(
+                outcome,
+                mes_status=MES_SKIPPED,
+                mes_message="空跑模式跳过 MES",
+                mes_pending_path="",
+            )
+        elif mes_start is None or mes_start.process_started_at is None:
+            finalized = replace(
+                outcome,
+                mes_status=MES_UNCONFIRMED,
+                mes_message="MES 结果上传未初始化",
+                mes_pending_path="",
+            )
+        else:
+            completion = complete_mes_run(
+                self.config_model.mes,
+                record,
+                records_root=self.config_model.records_root,
+                station_type=station_type,
+                process_started_at=mes_start.process_started_at,
+                device_result=outcome.result,
+                device_message=outcome.message,
+            )
+            finalized = replace(
+                outcome,
+                mes_status=completion.status,
+                mes_message=completion.message,
+                mes_pending_path=completion.pending_path,
+            )
+        record.finish(
+            finalized.result,
+            finalized.message,
+            mes_status=finalized.mes_status,
+            mes_details=finalized.mes_message,
+            mes_pending_path=finalized.mes_pending_path,
+        )
+        return finalized
+
     def _flow_worker(self, kind: str, sn: str, token: str, sn_enabled: bool) -> None:
         record = None
+        mes_start: MesRunStart | None = None
+        station = "HALF" if kind == "half" else "FULL"
         try:
-            station = "HALF" if kind == "half" else "FULL"
             if sn_enabled:
                 try:
                     storage = RunStorage(
@@ -1817,6 +2019,46 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
                 self.events.put(("log", "INFO", "空跑模式：跳过 SN 校验、SN 写入和文件记录"))
                 if not token:
                     self.events.put(("log", "INFO", "空跑模式：未填 token，将跳过 Factory unlock/lock"))
+
+            if sn_enabled:
+                if self.config_model.mes.checkroute_enabled:
+                    self.events.put(("mes_status", "MES：正在校验 SN 路由"))
+                else:
+                    self.events.put(("mes_status", "MES：暂不校验路由，测试完成后上传结果"))
+                mes_start = start_mes_run(
+                    self.config_model.mes,
+                    record,
+                    sn=sn,
+                    station_type=station,
+                )
+                if not mes_start.confirmed:
+                    record.finish(
+                        "MES_UNCONFIRMED",
+                        mes_start.message,
+                        mes_status=MES_UNCONFIRMED,
+                        mes_details=mes_start.message,
+                    )
+                    self.events.put(("mes_status", f"MES：配置或前置检查失败，测试未启动（{mes_start.message}）"))
+                    self.events.put((
+                        "flow_done",
+                        FlowOutcome(
+                            False,
+                            "MES_UNCONFIRMED",
+                            "MES 配置或前置检查失败，设备测试未启动",
+                            [],
+                            MES_UNCONFIRMED,
+                            mes_start.message,
+                        ),
+                    ))
+                    return
+                if mes_start.route_checked:
+                    self.events.put(("mes_status", "MES：路由已确认，等待测试结果上传"))
+                    self.events.put(("log", "OK", f"MES checkroute 已确认: {mes_start.message}"))
+                else:
+                    self.events.put(("mes_status", "MES：等待测试结果上传"))
+                    self.events.put(("log", "INFO", "MES checkroute 已跳过，测试完成后上传结果"))
+            else:
+                self.events.put(("mes_status", "MES：空跑模式跳过"))
 
             def line_cb(direction: str, line: str) -> None:
                 record.log_at(direction, line)
@@ -1849,8 +2091,14 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
                 self._close_client_for_flash()
                 flash_outcome = self._run_flash_for_flow(record, progress)
                 if not flash_outcome.ok:
-                    record.finish("NG", f"flash failed: {flash_outcome.message}")
-                    self.events.put(("flow_done", FlowOutcome(False, "NG", f"flash failed: {flash_outcome.message}", [])))
+                    outcome = self._finalize_flow_record(
+                        record,
+                        station_type=station,
+                        sn_enabled=sn_enabled,
+                        mes_start=mes_start,
+                        outcome=FlowOutcome(False, "NG", f"flash failed: {flash_outcome.message}", []),
+                    )
+                    self.events.put(("flow_done", outcome))
                     return
                 wait_s = max(0.0, float(self.config_model.flash_after_wait_s))
                 if wait_s > 0:
@@ -1858,8 +2106,14 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
                     time.sleep(wait_s)
                 client = self._reconnect_after_flash(record, line_cb, progress)
                 if client is None:
-                    record.finish("NG", "flash reconnect failed")
-                    self.events.put(("flow_done", FlowOutcome(False, "NG", "flash reconnect failed", [])))
+                    outcome = self._finalize_flow_record(
+                        record,
+                        station_type=station,
+                        sn_enabled=sn_enabled,
+                        mes_start=mes_start,
+                        outcome=FlowOutcome(False, "NG", "flash reconnect failed", []),
+                    )
+                    self.events.put(("flow_done", outcome))
                     return
                 flow_start_index = 3
             else:
@@ -1891,20 +2145,40 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
                     before_step=before_step,
                     start_index=flow_start_index,
                 )  # type: ignore[arg-type]
+            outcome = self._finalize_flow_record(
+                record,
+                station_type=station,
+                sn_enabled=sn_enabled,
+                mes_start=mes_start,
+                outcome=outcome,
+            )
             self.events.put(("flow_done", outcome))
         except Exception as exc:
+            outcome: FlowOutcome | None = None
             if record is not None:
                 try:
-                    record.finish("NG", str(exc))
+                    outcome = self._finalize_flow_record(
+                        record,
+                        station_type=station,
+                        sn_enabled=sn_enabled,
+                        mes_start=mes_start,
+                        outcome=FlowOutcome(False, "NG", str(exc), []),
+                    )
                 except Exception:
-                    pass
+                    try:
+                        record.finish("NG", str(exc))
+                    except Exception:
+                        pass
             self.events.put(("log", "ERR", f"流程失败: {exc}"))
-            self.events.put((
-                "popup",
-                "error",
-                "流程异常",
-                f"测试流程异常中断。\n\n错误摘要：{exc}\n\n请检查设备连接、COM 口或 BLE 连接后重新测试。",
-            ))
+            if outcome is not None:
+                self.events.put(("flow_done", outcome))
+            else:
+                self.events.put((
+                    "popup",
+                    "error",
+                    "流程异常",
+                    f"测试流程异常中断。\n\n错误摘要：{exc}\n\n请检查设备连接、COM 口或 BLE 连接后重新测试。",
+                ))
         finally:
             if self.client is not None:
                 if self._client_alive():
@@ -1925,16 +2199,49 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
         command = build_ota_command(self.config_model, address)
         if not messagebox.askyesno(
             "确认 OTA 升级",
-            "即将执行 OTA 升级，升级过程中请勿断电、断开 BLE 或移动设备。\n\n"
+            "即将执行 OTA 升级，升级过程中请勿断电或移动设备。\n"
+            "上位机会自动重启设备并接管 BLE 连接。\n\n"
             "OTA 不做固件版本限制。\n\n"
             + " ".join(command.argv),
         ):
             return
+        ota_client = self.client
+        self.client = None
+        if ota_client is not None:
+            self._set_connection_status("DISCONNECTED", "OTA 升级期间断开")
         self._set_busy(True)
 
         def worker() -> None:
             lines: list[str] = []
             try:
+                if ota_client is not None:
+                    transport = getattr(ota_client, "_transport", None)
+                    connected_address = str(getattr(transport, "address", "") or "").strip()
+                    same_ble_target = isinstance(transport, BLENusTransport) and (
+                        not address
+                        or not connected_address
+                        or connected_address.replace(":", "").replace("-", "").upper()
+                        == address.replace(":", "").replace("-", "").upper()
+                    )
+                    if same_ble_target:
+                        self.events.put(("log", "INFO", "OTA 前请求设备重启，以确保重新广播"))
+                        try:
+                            reset_result = ota_client.send_command("AT+RST", 4.0)
+                            if reset_result.ok:
+                                self.events.put(("log", "OK", "设备已接受 OTA 前重启请求"))
+                            else:
+                                self.events.put(("log", "WARN", "设备未确认 OTA 前重启，继续执行连接释放"))
+                        except Exception as exc:
+                            self.events.put(("log", "WARN", f"OTA 前重启请求异常，继续执行连接释放: {exc}"))
+                    self.events.put(("log", "INFO", "OTA 前释放上位机 BLE/AT 连接"))
+                    try:
+                        ota_client.close()
+                        if not ota_client.wait_closed(5.0):
+                            self.events.put(("log", "WARN", "上位机 BLE 连接线程未在 5 秒内完全退出"))
+                    except Exception as exc:
+                        self.events.put(("log", "WARN", f"OTA 前关闭连接异常: {exc}"))
+                    time.sleep(OTA_BLE_RELEASE_WAIT_S)
+
                 def _ota_log(level: str, line: str) -> None:
                     self.events.put(("log", level, line))
                     lines.append(line)
@@ -1962,7 +2269,8 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
 
         def worker() -> None:
             try:
-                backend = self.ble_scan_backend_var.get().strip() or "nrf_dongle"
+                pairing_enabled = self.ble_pairing_enabled_var.get()
+                backend = "windows" if pairing_enabled else (self.ble_scan_backend_var.get().strip() or "nrf_dongle")
                 dongle_port = self.ble_dongle_port_var.get().strip() or "COM8"
                 self.events.put(("log", "INFO", f"BLE 扫描: backend={backend} dongle={dongle_port}"))
                 devices = scan_ble_devices(
@@ -2122,25 +2430,41 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
     def _show_flow_done_popup(self, outcome: FlowOutcome) -> None:
         sn = self.sn_var.get().strip()
         sn_text = f"\nSN：{sn}" if self.sn_enabled_var.get() and sn else ""
+        if outcome.mes_status == MES_UNCONFIRMED:
+            pending_text = (
+                f"\n\n待重传文件：{outcome.mes_pending_path}"
+                if outcome.mes_pending_path
+                else ""
+            )
+            messagebox.showwarning(
+                "MES 未确认",
+                f"设备结果：{outcome.result}（{outcome.message}）{sn_text}\n\n"
+                f"MES 状态：未确认\nMES 详情：{outcome.mes_message}"
+                f"{pending_text}\n\n请勿将本次记录视为 MES 已上传成功。",
+            )
+            return
+        upload_success = outcome.mes_status == MES_CONFIRMED
+        upload_text = "\n\nMES 数据上传成功。" if upload_success else ""
         if outcome.ok:
-            messagebox.showinfo("测试通过", f"本次测试全部通过。{sn_text}")
+            title = "测试通过 / MES 上传成功" if upload_success else "测试通过"
+            messagebox.showinfo(title, f"本次测试全部通过。{sn_text}{upload_text}")
             return
         if outcome.result == "PENDING-HW":
-            messagebox.showwarning("需要继续验证", f"{outcome.message}{sn_text}")
+            messagebox.showwarning("需要继续验证", f"{outcome.message}{sn_text}{upload_text}")
             return
         if self._has_factory_locked_failure() or "factory_locked" in outcome.message:
             messagebox.showerror(
                 "设备未解锁",
                 "设备处于工厂锁定状态，无法执行硬件测试。\n\n"
                 "请确认运行 token 是否与设备端一致，注意连字符 '-' 和下划线 '_' 不同。\n\n"
-                "如仍失败，请联系工程人员解锁。",
+                f"如仍失败，请联系工程人员解锁。{upload_text}",
             )
             return
         failed = self._failed_step_names()
         failed_text = "、".join(failed) if failed else outcome.message
         messagebox.showerror(
-            "测试失败",
-            f"本次测试未通过。{sn_text}\n\n失败项：{failed_text}\n\n详情：{outcome.message}",
+            "测试失败 / MES 上传成功" if upload_success else "测试失败",
+            f"本次测试未通过。{sn_text}\n\n失败项：{failed_text}\n\n详情：{outcome.message}{upload_text}",
         )
 
     def _set_busy(self, busy: bool) -> None:
@@ -2340,9 +2664,20 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
                 event[5].set()
         elif kind == "popup":
             self._show_popup(event[1], event[2], event[3])
+        elif kind == "mes_status":
+            self.mes_status_var.set(event[1])
         elif kind == "flow_done":
             outcome: FlowOutcome = event[1]
             self._log("OK" if outcome.ok else "ERR", f"流程结束: {outcome.result} {outcome.message}")
+            if outcome.mes_status == MES_CONFIRMED:
+                self.mes_status_var.set(f"MES：已确认上传（{outcome.mes_message}）")
+                self._log("OK", f"MES 已确认上传: {outcome.mes_message}")
+            elif outcome.mes_status == MES_UNCONFIRMED:
+                pending = f"，待重传：{outcome.mes_pending_path}" if outcome.mes_pending_path else ""
+                self.mes_status_var.set(f"MES：未确认（{outcome.mes_message}）{pending}")
+                self._log("ERR", f"MES 未确认: {outcome.mes_message}{pending}")
+            else:
+                self.mes_status_var.set("MES：空跑模式跳过")
             if outcome.ok and self.active_flow_kind == "half" and self.active_flow_sn:
                 self.last_half_sn = self.active_flow_sn
             self._show_flow_done_popup(outcome)
@@ -2410,6 +2745,7 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
             cfg.uart_baudrate = 115200
         cfg.ble_name = self.ble_name_var.get().strip() or "AXI-P1-T"
         cfg.ble_scan_backend = self.ble_scan_backend_var.get().strip() or "nrf_dongle"
+        cfg.ble_pairing_enabled = self.ble_pairing_enabled_var.get()
         cfg.ble_dongle_port = self.ble_dongle_port_var.get().strip() or "COM8"
         cfg.ble_dongle_sd_version = self.ble_dongle_sd_var.get().strip() or "auto"
         cfg.nrf_connect_ble_path = self.nrf_connect_ble_path_var.get().strip()
@@ -2445,6 +2781,21 @@ AT+DIAG=STACK                     - 栈高水位诊断（需编译开启）
             return
         cfg.sn_rule.prefix = self.sn_prefix_var.get().strip()
         cfg.sn_rule.regex = self.sn_regex_var.get().strip()
+        cfg.mes.checkroute_url = self.mes_checkroute_url_var.get().strip()
+        cfg.mes.checkroute_enabled = self.mes_checkroute_enabled_var.get()
+        cfg.mes.postxtdata_url = self.mes_postxtdata_url_var.get().strip()
+        cfg.mes.device = self.mes_device_var.get().strip()
+        cfg.mes.line = self.mes_line_var.get().strip()
+        cfg.mes.half_station = self.mes_half_station_var.get().strip()
+        cfg.mes.full_station = self.mes_full_station_var.get().strip()
+        cfg.mes.response_success_field = self.mes_success_field_var.get().strip()
+        cfg.mes.http_2xx_is_success = self.mes_http_2xx_var.get()
+        try:
+            cfg.mes.timeout_s = float(self.mes_timeout_var.get().strip() or "5")
+        except ValueError:
+            if not silent:
+                messagebox.showerror("设置错误", "MES 超时秒数必须是数字")
+            return
         save_config(cfg)
         self._sync_auth_status()
         self._refresh_flash_text()

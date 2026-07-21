@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import threading
 from dataclasses import dataclass
 
 
@@ -30,20 +31,37 @@ class UARTTransport:
             raise RuntimeError("pyserial is required: pip install pyserial") from exc
         self._serial = serial.Serial(port, baudrate=baudrate, timeout=0.05)
         self._rx = bytearray()
+        self._io_lock = threading.RLock()
+        self._closed = False
 
     def close(self) -> None:
-        self._serial.close()
+        with self._io_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._rx.clear()
+            self._serial.close()
+
+    def is_connected(self) -> bool:
+        with self._io_lock:
+            return not self._closed and bool(self._serial.is_open)
 
     def clear_input(self) -> None:
-        try:
-            self._serial.reset_input_buffer()
-        except Exception:
-            pass
-        self._rx = bytearray()
+        with self._io_lock:
+            if self._closed:
+                return
+            try:
+                self._serial.reset_input_buffer()
+            except Exception:
+                pass
+            self._rx.clear()
 
     def write_line(self, command: str) -> None:
-        self._serial.write((command.rstrip("\r\n") + "\r\n").encode("ascii"))
-        self._serial.flush()
+        with self._io_lock:
+            if self._closed:
+                raise RuntimeError("UART port is closed")
+            self._serial.write((command.rstrip("\r\n") + "\r\n").encode("ascii"))
+            self._serial.flush()
 
     def _pop_buffered_line(self) -> str | None:
         while b"\n" in self._rx:
@@ -60,7 +78,10 @@ class UARTTransport:
             line = self._pop_buffered_line()
             if line is not None:
                 return line
-            chunk = self._serial.read(256)
+            with self._io_lock:
+                if self._closed:
+                    return None
+                chunk = self._serial.read(256)
             if chunk:
                 self._rx.extend(chunk)
                 line = self._pop_buffered_line()

@@ -10,6 +10,7 @@ from .config import redact_sensitive_text
 
 UART_READY_BANNER = "+AT:ready,transport=uart"
 UART_DIAG_PREFIXES = ("[CHARGER][UART]", "+PWR:")
+NOISE_REPEAT_EMIT_INTERVAL_S = 0.5
 
 
 class ATTransport(Protocol):
@@ -64,6 +65,8 @@ def is_noise_line(line: str, expected: str | None = None) -> bool:
         return True
     if line.startswith("status charging="):
         return True
+    if line.isdigit():
+        return True
     if line.startswith(("[PROBE][UART]", "[BOOT][UART]", "[INF]", "[WRN]", "[ERR]", "[DBG]")):
         return True
     if line.startswith("[00:") or line.startswith("*** Booting "):
@@ -84,6 +87,12 @@ class ATClient:
 
     def close(self) -> None:
         self._transport.close()
+
+    def wait_closed(self, timeout_s: float = 5.0) -> bool:
+        waiter = getattr(self._transport, "wait_closed", None)
+        if not callable(waiter):
+            return True
+        return bool(waiter(timeout_s))
 
     def is_connected(self) -> bool:
         checker = getattr(self._transport, "is_connected", None)
@@ -109,16 +118,26 @@ class ATClient:
             ignored = 0
             expected = expected_prefix(command)
             payload_seen = expected is None
+            last_noise_line = ""
+            last_noise_emit_at = 0.0
             deadline = start + timeout_s
             while time.monotonic() < deadline:
                 remaining = max(0.05, min(0.25, deadline - time.monotonic()))
                 line = self._transport.read_line(remaining)
                 if line is None:
                     continue
-                self._emit("RX", line)
                 if is_noise_line(line, expected):
                     ignored += 1
+                    now = time.monotonic()
+                    if line != last_noise_line or now - last_noise_emit_at >= NOISE_REPEAT_EMIT_INTERVAL_S:
+                        self._emit("RX", line)
+                        last_noise_line = line
+                        last_noise_emit_at = now
+                    # A disconnected/re-enumerating Windows CDC port can return
+                    # one stale line in a tight loop. Avoid a CPU/log flood.
+                    time.sleep(0.001)
                     continue
+                self._emit("RX", line)
                 lines.append(line)
                 if line.startswith("+CME ERROR:"):
                     return CommandResult(command, False, lines, ignored, time.monotonic() - start)

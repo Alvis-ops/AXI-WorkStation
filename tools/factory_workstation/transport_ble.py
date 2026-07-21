@@ -393,6 +393,7 @@ class BLENusTransport:
         address: str = "",
         scan_timeout_s: float = 12.0,
         backend: str = "bleak",
+        pair: bool = False,
         dongle_port: str = "COM8",
         nrf_connect_ble_path: str = "",
         dongle_sd_version: str = "auto",
@@ -401,6 +402,7 @@ class BLENusTransport:
         self.address = address
         self.scan_timeout_s = scan_timeout_s
         self._backend = (backend or "bleak").strip().lower().replace("-", "_")
+        self._pair = bool(pair)
         self._dongle_port = dongle_port or "COM8"
         self._nrf_connect_ble_path = nrf_connect_ble_path
         self._dongle_sd_version = dongle_sd_version or "auto"
@@ -430,13 +432,16 @@ class BLENusTransport:
     def _init_bleak(self) -> None:
         self._thread = threading.Thread(target=self._thread_main, daemon=True)
         self._thread.start()
-        if not self._ready.wait(self.scan_timeout_s + 20.0):
+        pairing_allowance_s = 70.0 if self._pair else 20.0
+        if not self._ready.wait(self.scan_timeout_s + pairing_allowance_s):
             self.close()
             raise TimeoutError("BLE connect timed out")
         if self._error is not None:
             raise RuntimeError(f"BLE connect failed: {self._error}") from self._error
 
     def _init_dongle(self) -> None:
+        if self._pair:
+            raise RuntimeError("BLE authentication/pairing requires the Windows BLE backend")
         if not self.address:
             raise RuntimeError("nRF dongle backend requires a BLE address; scan first")
         exe = _find_nrf_connect_ble_exe(self._nrf_connect_ble_path)
@@ -566,6 +571,10 @@ class BLENusTransport:
             "dongle_sd_version": self._dongle_sd_version,
         }
 
+    @property
+    def pairing_enabled(self) -> bool:
+        return self._pair
+
     def _thread_main(self) -> None:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
@@ -614,8 +623,12 @@ class BLENusTransport:
                 target = devices[0].device or devices[0].address
         if target is None:
             raise TimeoutError(f"BLE target not found: {self.name}")
-        self._client = BleakClient(target, timeout=15.0)
-        await self._client.connect()
+        connect_timeout = max(60.0, self.scan_timeout_s + 20.0) if self._pair else 15.0
+        self._client = BleakClient(target, timeout=connect_timeout, pair=self._pair)
+        if self._pair:
+            await self._client.connect(protection_level=3)
+        else:
+            await self._client.connect()
         await asyncio.sleep(0.5)
         await self._client.start_notify(NUS_TX_UUID, self._on_notify)
         await asyncio.sleep(1.5)
@@ -664,6 +677,16 @@ class BLENusTransport:
             fut.cancel()
         except Exception:
             pass
+
+    def wait_closed(self, timeout_s: float = 5.0) -> bool:
+        if self._backend in {"nrf", "nrf_dongle", "dongle", "pc_ble_driver"}:
+            proc = self._dongle_proc
+            return proc is None or proc.poll() is not None
+        thread = getattr(self, "_thread", None)
+        if thread is None or thread is threading.current_thread():
+            return thread is None
+        thread.join(max(0.0, timeout_s))
+        return not thread.is_alive()
 
     def clear_input(self) -> None:
         while True:
