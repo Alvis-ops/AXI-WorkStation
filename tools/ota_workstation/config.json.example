@@ -1,0 +1,14 @@
+{
+  "ble_backend": "nrf_dongle",
+  "ble_name": "AXI-P1-T",
+  "ble_address": "",
+  "ble_pairing_enabled": false,
+  "dongle_port": "COM8",
+  "dongle_sd_version": "auto",
+  "nrf_connect_ble_path": "",
+  "image_path": "firmware\\zephyr.signed.bin",
+  "profile": "safe",
+  "scan_timeout_s": 8.0,
+  "reboot_wait_s": 15.0,
+  "verify_after_reset": true
+}

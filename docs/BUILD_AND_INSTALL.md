@@ -1,6 +1,6 @@
 # 构建与安装说明
 
-本文说明如何从源码构建 AXI 半机/整机上位机、裸板上位机，以及如何制作 Win10 x64 离线 USB 安装包。
+本文说明如何从源码构建 AXI 半机/整机上位机、独立 OTA 上位机、裸板上位机，以及如何制作 Win10 x64 离线 USB 安装包。
 
 ## 1. 准备构建环境
 
@@ -71,6 +71,20 @@ python -m PyInstaller --clean --noconfirm "Axi Bare Board Workstation.spec"
 ```text
 dist/Axi Bare Board Workstation/
 ```
+
+## 3.1 构建独立 OTA 上位机
+
+```powershell
+python -m PyInstaller --clean --noconfirm "Axi OTA Workstation.spec"
+```
+
+输出目录：
+
+```text
+dist/Axi OTA Workstation/
+```
+
+目录内应至少包含 `Axi OTA Workstation.exe`、`Axi OTA BLE Helper.exe` 和 `Axi OTA Dongle Helper.exe`。BLE Helper 的源码同样从相邻固件仓库 `..\axi-p1-embeded\tools\ota_smp_ble.py` 读取。
 
 ## 4. 本机便携运行
 
@@ -179,6 +193,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\packaging\bare_board\build
 python tools\factory_workstation\smoke_p1_0h.py
 python tools\factory_workstation\smoke_mes.py
 python -m tools.bare_board_workstation.smoke_bare_board
+python -m tools.ota_workstation.smoke_ota
 git diff --check
 ```
 
@@ -188,6 +203,9 @@ git diff --check
 Test-Path "dist\Axi Factory Workstation\Axi Factory Workstation.exe"
 Test-Path "dist\Axi Factory Workstation\Axi Factory Workstation CLI.exe"
 Test-Path "dist\Axi Factory Workstation\Axi OTA Helper.exe"
+Test-Path "dist\Axi OTA Workstation\Axi OTA Workstation.exe"
+Test-Path "dist\Axi OTA Workstation\Axi OTA BLE Helper.exe"
+Test-Path "dist\Axi OTA Workstation\Axi OTA Dongle Helper.exe"
 ```
 
 完整交付还需在干净的 Win10 x64 电脑上完成安装测试，并分别验证 GUI 启动、UART、BLE、J-Link、OTA、MES 和记录路径。
